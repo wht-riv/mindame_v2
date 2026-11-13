@@ -1,6 +1,6 @@
 import React,{useEffect,useMemo,useState}from'react';
 import{addDoc,collection,deleteDoc,doc,getDoc,getDocs,limit,query,serverTimestamp,setDoc,updateDoc,where}from'firebase/firestore';
-import{db,firebaseReady,ensureAnonymousUser}from'./firebase.js';
+import{db,firebaseReady,ensureAnonymousUser,auth}from'./firebase.js';
 
 const EXCUSES=[
  '眠い・だるい',
@@ -152,59 +152,75 @@ export default function App(){
   await loadAll();setFlow(null);setTab('home');msg('振り返りを記録しました。');
  }
 
- async function loadCommunity(){
-  const snap=await getDocs(query(collection(db,'publicPostsV4'),where('isVisible','==',true),limit(50)));
-  const all=snap.docs.map(x=>({id:x.id,...x.data()}));
-  await Promise.all(all.map(async p=>{
-   const reactions=await getDocs(collection(db,'publicPostsV4',p.id,'reactions'));
-   const counts={wakaru:0,sankou:0,dekisou:0};
-   const myReactions={wakaru:false,sankou:false,dekisou:false};
-   reactions.docs.forEach(x=>{
-    const d=x.data();
-    const type=d.type;
-    if(type&&counts[type]!==undefined)counts[type]++;
-    // docId は "{uid}_{type}" 形式
-    if(d.ownerUid===uid&&type&&myReactions[type]!==undefined)myReactions[type]=true;
-   });
-   p.counts=counts;
-   p.myReactions=myReactions;
-  }));
-  setPosts(all.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0)));
- }
-
- useEffect(()=>{if(tab==='community'&&uid)loadCommunity()},[tab,uid]);
-
- async function react(post,type){
-  const wasSelected=!!(post.myReactions&&post.myReactions[type]);
-  const nextSelected=!wasSelected;
-  // 楽観的UI更新
-  setPosts(list=>list.map(p=>{
-   if(p.id!==post.id)return p;
-   const nextCounts={...(p.counts||{wakaru:0,sankou:0,dekisou:0})};
-   nextCounts[type]=Math.max(0,(nextCounts[type]||0)+(nextSelected?1:-1));
-   return{...p,counts:nextCounts,myReactions:{...(p.myReactions||{}),[type]:nextSelected}};
-  }));
-  // docId を "{uid}_{type}" にして Firestore ルールの mine(uid) を満たす
-  const reactDocId=`${uid}_${type}`;
-  const ref=doc(db,'publicPostsV4',post.id,'reactions',reactDocId);
-  try{
-   if(wasSelected){
-    await deleteDoc(ref);
-   }else{
-    await setDoc(ref,{ownerUid:uid,type,createdAt:serverTimestamp()});
-   }
-  }catch(e){
-   console.error('react error:',e);
-   // ロールバック
-   setPosts(list=>list.map(p=>{
-    if(p.id!==post.id)return p;
-    const prevCounts={...(p.counts||{})};
-    prevCounts[type]=Math.max(0,(prevCounts[type]||0)+(wasSelected?1:-1));
-    return{...p,counts:prevCounts,myReactions:{...(p.myReactions||{}),[type]:wasSelected}};
+  async function loadCommunity(){
+   const currentUser=auth?.currentUser||(await ensureAnonymousUser());
+   const currentUid=currentUser?.uid||uid;
+   const snap=await getDocs(query(collection(db,'publicPostsV4'),where('isVisible','==',true),limit(50)));
+   const all=snap.docs.map(x=>({id:x.id,...x.data()}));
+   await Promise.all(all.map(async p=>{
+    const reactions=await getDocs(collection(db,'publicPostsV4',p.id,'reactions'));
+    const counts={wakaru:0,sankou:0,dekisou:0};
+    let myReaction=null;
+    reactions.docs.forEach(x=>{
+     const d=x.data();
+     const type=d.type;
+     if(type&&counts[type]!==undefined)counts[type]++;
+     if((x.id===currentUid||d.ownerUid===currentUid)&&type&&counts[type]!==undefined){
+      myReaction=type;
+     }
+    });
+    p.counts=counts;
+    p.myReaction=myReaction;
    }));
-   msg('リアクションを保存できませんでした。');
+   setPosts(all.sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0)));
   }
- }
+
+  useEffect(()=>{if(tab==='community'&&uid)loadCommunity()},[tab,uid]);
+
+  async function react(post,reactionId){
+   const currentUser=auth?.currentUser||(await ensureAnonymousUser());
+   const currentUid=currentUser?.uid||uid;
+   if(!currentUid){
+    msg('認証が確認できませんでした。');
+    return;
+   }
+   const validTypes=['wakaru','sankou','dekisou'];
+   if(!validTypes.includes(reactionId))return;
+
+   const prevMyReaction=post.myReaction;
+   const prevCounts={...(post.counts||{wakaru:0,sankou:0,dekisou:0})};
+
+   const isSame=prevMyReaction===reactionId;
+   const nextMyReaction=isSame?null:reactionId;
+   const nextCounts={...prevCounts};
+   if(prevMyReaction&&nextCounts[prevMyReaction]!==undefined){
+    nextCounts[prevMyReaction]=Math.max(0,(nextCounts[prevMyReaction]||0)-1);
+   }
+   if(!isSame&&nextCounts[reactionId]!==undefined){
+    nextCounts[reactionId]=(nextCounts[reactionId]||0)+1;
+   }
+
+   // 楽観的UI更新
+   setPosts(list=>list.map(p=>p.id===post.id?{...p,counts:nextCounts,myReaction:nextMyReaction}:p));
+
+   const ref=doc(db,'publicPostsV4',post.id,'reactions',currentUid);
+   try{
+    if(isSame){
+     await deleteDoc(ref);
+    }else{
+     await setDoc(ref,{
+      ownerUid:currentUid,
+      type:reactionId,
+      updatedAt:serverTimestamp()
+     });
+    }
+   }catch(err){
+    console.error('Reaction error:',err.code,err.message,err);
+    // ロールバック
+    setPosts(list=>list.map(p=>p.id===post.id?{...p,counts:prevCounts,myReaction:prevMyReaction}:p));
+    msg('リアクションを保存できませんでした。');
+   }
+  }
 
  async function hidePost(post){
   if(post.ownerUid!==uid)return;
@@ -660,7 +676,7 @@ function Post({post,uid,react,hidePost}){
       key={r.id}
       type="button"
       aria-label={r.label}
-      className={(post.myReactions&&post.myReactions[r.id])?'selected seed-button':'seed-button'}
+      className={post.myReaction===r.id?'selected seed-button':'seed-button'}
       onClick={()=>react(post,r.id)}
      >{r.icon} {r.label} <span>{(post.counts&&post.counts[r.id])||0}</span></button>
     ))}
