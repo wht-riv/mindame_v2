@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, limit, query, serverTimestamp, setDoc, Timestamp, updateDoc, where } from 'firebase/firestore';
+import { addDoc, collection, deleteDoc, deleteField, doc, getDoc, getDocs, limit, query, serverTimestamp, setDoc, Timestamp, updateDoc, where } from 'firebase/firestore';
 import { db, firebaseReady, ensureAnonymousUser } from './firebase.js';
 
 const APP_VERSION = '6.1.0';
@@ -75,7 +75,7 @@ const REACTIONS = [
   { id: 'dekisou', label: 'できそう', icon: '👣' }
 ];
 
-const LIMITS = { intention: 80, excuse: 60, step: 80, alternative: 80 };
+const LIMITS = { intention: 80, excuse: 60, step: 80, alternative: 500 };
 const SK = 'mindameParticipantCodeV53';
 const clean = v => v.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 20);
 const uniq = xs => xs.filter((x, i, a) => x && a.indexOf(x) === i);
@@ -118,6 +118,13 @@ function isReviewLocked(record, demoMode) {
   return ms ? Date.now() < ms : false;
 }
 // ---- 結果定義・旧データ互換・集計 ----
+/**
+ * type ActionResult =
+ *   | "planned_method"
+ *   | "not_started"
+ *   | "alternative_method";
+ * @typedef {"planned_method" | "not_started" | "alternative_method"} ActionResult
+ */
 const ACTION_RESULTS = [
   { value: 'planned_method', label: '最初に決めた方法で、取りかかることができた' },
   { value: 'not_started', label: '取りかかることができなかった' },
@@ -126,9 +133,9 @@ const ACTION_RESULTS = [
 const VALID_ACTION_RESULTS = ACTION_RESULTS.map(x => x.value);
 
 const ACTION_RESULT_SHORT_LABELS = {
-  planned_method: '最初に決めた方法で着手',
-  not_started: '未着手',
-  alternative_method: 'ほかの方法で着手'
+  planned_method: '最初に決めた方法で取りかかれた',
+  not_started: '取りかかれなかった',
+  alternative_method: 'ほかの方法で取りかかれた'
 };
 
 // 新形式（actionResult）と旧形式（outcomeStatus: done/acted/partial/changed/not_started/not_done）の両方を安全に正規化する
@@ -152,7 +159,7 @@ const isStartedResult = rOrStatus => {
 
 const getActionResultLabel = rOrStatus => {
   const res = normalizeActionResult(rOrStatus);
-  return res ? ACTION_RESULT_SHORT_LABELS[res] : '振り返り前';
+  return res ? ACTION_RESULT_SHORT_LABELS[res] : '振り返りなし';
 };
 
 // 集計処理：1. 3分類（当初方法による着手・未着手・代替方法による着手）、2. 着手の有無（着手あり・着手なし）
@@ -225,7 +232,7 @@ export default function App() {
 
   // エラーログ（個人情報・入力内容は保存しない。失敗しても再帰しない）
   async function logError(errorType, operation, err) {
-    console.error('App error:', errorType, operation, err && err.code);
+    console.error(`App error [${errorType}:${operation}]:`, err?.code, err?.message, err);
     try {
       if (!uid) return;
       await addDoc(collection(db, 'systemErrorsV1'), {
@@ -238,7 +245,7 @@ export default function App() {
         createdAt: serverTimestamp()
       });
     } catch (e) {
-      console.error('Error log failed:', e && e.code);
+      console.error('Error log failed:', e?.code, e?.message, e);
     }
   }
 
@@ -386,8 +393,6 @@ export default function App() {
         excuseSource,
         firstStepText: step,
         stepSource,
-        actionResult: null,
-        alternativeActionText: null,
         outcomeStatus: null,
         predictionMatched: null,
         actualExcuse: null,
@@ -461,7 +466,7 @@ export default function App() {
 
   async function openReview(targetRecord = null) {
     const target = targetRecord && targetRecord.id ? targetRecord : pending;
-    if (!target) return;
+    if (!target || !uid || (target.ownerUid && target.ownerUid !== uid)) return;
     const isUnreviewed = !normalizeActionResult(target);
     if (isUnreviewed && isReviewLocked(target, demoMode)) return;
     setReviewTarget(target);
@@ -471,7 +476,14 @@ export default function App() {
     logEvent('review_opened', { recordId: target.id });
     if (!target.reviewStartedAt) {
       try {
-        await updateDoc(doc(db, 'participantsV4', uid, 'records', target.id), { reviewStartedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+        const startPatch = {
+          ownerUid: uid,
+          reviewStartedAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        };
+        if ('actionResult' in target && target.actionResult == null) startPatch.actionResult = deleteField();
+        if ('alternativeActionText' in target && target.alternativeActionText == null) startPatch.alternativeActionText = deleteField();
+        await updateDoc(doc(db, 'participantsV4', uid, 'records', target.id), startPatch);
         reviewStartSaved.current = true;
       } catch (e) {
         logError('write', 'reviewStart', e);
@@ -481,14 +493,18 @@ export default function App() {
 
   async function saveReview(v) {
     const target = reviewTarget || pending;
-    if (saving || savingRef.current || !target) return;
+    if (saving || savingRef.current || !target || !target.id) return false;
+    if (!uid || (target.ownerUid && target.ownerUid !== uid)) {
+      msg('記録を更新する権限がありません。');
+      return false;
+    }
     const actionResult = v.actionResult || v.outcomeStatus;
-    if (!VALID_ACTION_RESULTS.includes(actionResult)) return;
+    if (!VALID_ACTION_RESULTS.includes(actionResult)) return false;
     const altText = actionResult === 'alternative_method' ? (v.alternativeActionText || '').trim() : '';
-    if (actionResult === 'alternative_method' && (!altText || altText.length > LIMITS.alternative)) return;
+    if (actionResult === 'alternative_method' && (!altText || altText.length > LIMITS.alternative)) return false;
     if (actionResult === 'not_started') {
-      if (!['yes', 'no', 'unknown'].includes(v.predictionMatched)) return;
-      if (v.predictionMatched === 'no' && !(v.actualExcuse || '').trim()) return;
+      if (!['yes', 'no', 'unknown'].includes(v.predictionMatched)) return false;
+      if (v.predictionMatched === 'no' && !(v.actualExcuse || '').trim()) return false;
     }
     savingRef.current = true;
     setSaving(true);
@@ -497,22 +513,60 @@ export default function App() {
       const actual = actionResult === 'not_started' && v.predictionMatched === 'no' ? (v.actualExcuse || '').trim() : null;
       const actualExcuseSource = actual ? (saved.includes(actual) ? 'saved' : EXCUSES.includes(actual) ? 'preset' : 'custom') : null;
       const data = {
+        ownerUid: uid,
         actionResult,
         outcomeStatus: actionResult,
-        alternativeActionText: actionResult === 'alternative_method' ? altText : null,
-        predictionMatched: actionResult === 'not_started' ? (v.predictionMatched || null) : null,
-        actualExcuse: actual || null,
-        actualExcuseSource: actionResult === 'not_started' ? actualExcuseSource : null,
+        alternativeActionText: actionResult === 'alternative_method' ? altText : deleteField(),
+        predictionMatched: actionResult === 'not_started' ? (v.predictionMatched || null) : deleteField(),
+        actualExcuse: actionResult === 'not_started' && actual ? actual : deleteField(),
+        actualExcuseSource: actionResult === 'not_started' && actual ? actualExcuseSource : deleteField(),
         reviewCompletedAt: serverTimestamp(),
         reviewedAt: serverTimestamp(),
         updatedAt: serverTimestamp()
       };
+      if (actionResult !== 'not_started') data.selfBlameAfterNotStarted = deleteField();
       if (!reviewStartSaved.current && reviewOpenedAt.current) data.reviewStartedAt = Timestamp.fromDate(reviewOpenedAt.current);
+
       await updateDoc(doc(db, 'participantsV4', uid, 'records', target.id), data);
+
+      setRecords(prev => prev.map(r => {
+        if (r.id !== target.id) return r;
+        const next = {
+          ...r,
+          ownerUid: uid,
+          actionResult,
+          outcomeStatus: actionResult,
+          reviewedAt: Timestamp.now(),
+          updatedAt: Timestamp.now()
+        };
+        if (actionResult === 'alternative_method') next.alternativeActionText = altText;
+        else delete next.alternativeActionText;
+        if (actionResult === 'not_started') {
+          next.predictionMatched = v.predictionMatched || null;
+          if (actual) {
+            next.actualExcuse = actual;
+            next.actualExcuseSource = actualExcuseSource;
+          } else {
+            delete next.actualExcuse;
+            delete next.actualExcuseSource;
+          }
+        } else {
+          delete next.predictionMatched;
+          delete next.actualExcuse;
+          delete next.actualExcuseSource;
+          delete next.selfBlameAfterNotStarted;
+        }
+        return next;
+      }));
+
       if (actionResult === 'not_started' && v.addActualToLibrary && actual) {
-        const xs = cleanList([actual, ...listOf(profile.customExcuses)]).slice(0, 20);
-        await updateDoc(doc(db, 'participantsV4', uid), { customExcuses: xs, updatedAt: serverTimestamp() });
-        setProfile(p => ({ ...p, customExcuses: xs }));
+        try {
+          const xs = cleanList([actual, ...listOf(profile.customExcuses)]).slice(0, 20);
+          await updateDoc(doc(db, 'participantsV4', uid), { customExcuses: xs, updatedAt: serverTimestamp() });
+          setProfile(p => ({ ...p, customExcuses: xs }));
+        } catch (e) {
+          logError('write', 'addActualToLibrary', e);
+        }
       }
       logEvent('review_completed', { recordId: target.id });
       await loadAll();
@@ -520,9 +574,12 @@ export default function App() {
       setFlow(null);
       setTab('home');
       msg('振り返りを記録しました。');
+      return true;
     } catch (e) {
+      console.error('saveReview error:', e?.code, e?.message, e);
       logError('write', 'saveReview', e);
       msg('記録できませんでした。');
+      return false;
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -803,10 +860,13 @@ function Home({ pending, latestReviewed, pendingLocked, current, planBlocked, re
           </>
         ) : latestReviewed ? (
           <>
-            <p className="pair"><span>前回の記録</span><b>{intentionOf(latestReviewed)}</b></p>
-            <p className="pair"><span>結果</span><b>{getActionResultLabel(latestReviewed)}</b></p>
+            <div className="post-head">
+              <strong>前回の振り返り</strong>
+              <span className={`result-badge ${latestRes || ''}`}>{getActionResultLabel(latestReviewed)}</span>
+            </div>
+            <p className="pair"><span>今日したいこと</span><b>{intentionOf(latestReviewed)}</b></p>
             {latestRes === 'alternative_method' && latestReviewed.alternativeActionText && (
-              <p className="pair"><span>できた方法</span><b>{latestReviewed.alternativeActionText}</b></p>
+              <p className="pair"><span>ほかの方法</span><b>{latestReviewed.alternativeActionText}</b></p>
             )}
             <button type="button" className="secondary" onClick={() => review(latestReviewed)}>振り返りを編集する</button>
           </>
@@ -934,7 +994,7 @@ function Plan({ profile, records, save, saving, back }) {
         hint="候補を参考にしながら、自分の言葉で書いてください。"
         items={intentionItems} state={intention} setState={setIntention}
         maxLength={LIMITS.intention} placeholder="例：机の上を片付けたい"
-        example="入力例：机の上を片付けたい／洗濯物をしまいたい／食器を洗いたい"
+        example="入力例：机の上を片付けたい／洗濯物をしまいたい／風呂に入りたい"
       />
       <ChipPick
         id="plan-excuse"
@@ -1028,7 +1088,7 @@ function Review({ item, profile, save, saving, back }) {
     }
   };
 
-  const handleSubmit = e => {
+  const handleSubmit = async e => {
     e.preventDefault();
     if (saving) return;
     if (!VALID_ACTION_RESULTS.includes(actionResult)) {
@@ -1060,14 +1120,23 @@ function Review({ item, profile, save, saving, back }) {
       }
     }
     setError('');
-    save({
-      actionResult,
-      outcomeStatus: actionResult,
-      alternativeActionText: actionResult === 'alternative_method' ? alternativeText.trim() : null,
-      predictionMatched: actionResult === 'not_started' ? match : null,
-      actualExcuse: actionResult === 'not_started' && match === 'no' ? actual.trim() : null,
-      addActualToLibrary: actionResult === 'not_started' && match === 'no' && addActual
-    });
+    try {
+      const payload = {
+        actionResult,
+        outcomeStatus: actionResult,
+        predictionMatched: actionResult === 'not_started' ? match : null,
+        actualExcuse: actionResult === 'not_started' && match === 'no' ? actual.trim() : null,
+        addActualToLibrary: actionResult === 'not_started' && match === 'no' && addActual
+      };
+      if (actionResult === 'alternative_method') {
+        payload.alternativeActionText = alternativeText.trim();
+      }
+      const ok = await save(payload);
+      if (ok === false) setError('saveFailed');
+    } catch (err) {
+      console.error('Review submit error:', err?.code, err?.message, err);
+      setError('saveFailed');
+    }
   };
 
   return (
@@ -1105,21 +1174,21 @@ function Review({ item, profile, save, saving, back }) {
       {actionResult === 'alternative_method' && (
         <Card>
           <h2><label htmlFor="alternative-action-input">どのような方法で取りかかることができましたか？</label></h2>
-          <p id="alternative-action-hint" className="muted">最初に考えていた方法ではなく、実際にできたことを書いてください。</p>
+          <p id="alternative-action-hint" className="muted">最初に考えていた方法との違いが分かるように、実際にできたことを書いてください。</p>
           <input
             id="alternative-action-input"
             ref={altRef}
             value={alternativeText}
-            maxLength={LIMITS.alternative}
             onChange={e => {
               setAlternativeText(e.target.value);
-              if (error === 'alternative' || error === 'alternativeLength') setError('');
+              if (error === 'alternative' || error === 'alternativeLength' || error === 'saveFailed') setError('');
             }}
-            placeholder="例：1つだけ片付けた／場所を変えて5分だけ手をつけた"
+            placeholder="例：全部片付ける代わりに、机の上のものだけ箱に入れた"
             aria-required="true"
-            aria-invalid={error === 'alternative' || error === 'alternativeLength'}
+            aria-invalid={error === 'alternative' || error === 'alternativeLength' || alternativeText.trim().length > LIMITS.alternative}
             aria-describedby={error === 'alternative' || error === 'alternativeLength' ? 'alternative-action-hint alternative-action-error' : 'alternative-action-hint'}
           />
+          <small className="char-count" aria-live="polite">{alternativeText.trim().length} / {LIMITS.alternative}文字</small>
           {error === 'alternative' && (
             <p id="alternative-action-error" className="field-error" role="alert">実際にできた方法を入力してください。</p>
           )}
@@ -1199,7 +1268,10 @@ function Review({ item, profile, save, saving, back }) {
           )}
         </Card>
       )}
-      <button type="submit" className="primary" disabled={saving}>保存する</button>
+      {error === 'saveFailed' && (
+        <p className="field-error" role="alert">保存できませんでした。入力内容は残っていますので、通信状況を確認してもう一度お試しください。</p>
+      )}
+      <button type="submit" className="primary" disabled={saving}>{saving ? '保存しています...' : '保存する'}</button>
     </form>
   );
 }

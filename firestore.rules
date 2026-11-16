@@ -6,6 +6,47 @@ service cloud.firestore {
     function shortText(value, max) { return value is string && value.size() > 0 && value.size() <= max; }
     function optShort(data, field, max) { return !(field in data) || shortText(data[field], max); }
 
+    function validActionResult(data) {
+      return !('actionResult' in data)
+        || data.actionResult in [
+          'planned_method',
+          'not_started',
+          'alternative_method'
+        ];
+    }
+
+    function validAlternativeAction(data) {
+      return !('actionResult' in data)
+        || (
+          data.actionResult == 'alternative_method'
+            ? (
+                'alternativeActionText' in data
+                && shortText(data.alternativeActionText, 500)
+              )
+            : (
+                !('alternativeActionText' in data)
+                || data.alternativeActionText == null
+              )
+        );
+    }
+
+    function validReviewTimestamps(data) {
+      return (
+        !('reviewedAt' in data)
+        || data.reviewedAt == null
+        || data.reviewedAt is timestamp
+      ) && (
+        !('updatedAt' in data)
+        || data.updatedAt is timestamp
+      );
+    }
+
+    function validReview(data) {
+      return validActionResult(data)
+        && validAlternativeAction(data)
+        && validReviewTimestamps(data);
+    }
+
     match /participantsV4/{uid} {
       allow get: if mine(uid);
       allow create: if mine(uid) && request.resource.data.ownerUid == uid;
@@ -18,8 +59,12 @@ service cloud.firestore {
           && request.resource.data.ownerUid == uid
           && shortText(request.resource.data.predictedExcuse, 100)
           && shortText(request.resource.data.firstStepText, 100)
-          && optShort(request.resource.data, 'dailyIntentionText', 80);
-        allow update: if mine(uid) && resource.data.ownerUid == uid && request.resource.data.ownerUid == uid;
+          && optShort(request.resource.data, 'dailyIntentionText', 80)
+          && validReview(request.resource.data);
+        allow update: if mine(uid)
+          && (!('ownerUid' in resource.data) || resource.data.ownerUid == uid)
+          && request.resource.data.ownerUid == uid
+          && validReview(request.resource.data);
         allow delete: if false;
       }
 
@@ -39,8 +84,11 @@ service cloud.firestore {
         && request.resource.data.isVisible == true
         && shortText(request.resource.data.excuseText, 100)
         && optShort(request.resource.data, 'dailyIntentionText', 80)
+        && !('actionResult' in request.resource.data)
+        && !('alternativeActionText' in request.resource.data)
         && !('selfBlameAfterNotStarted' in request.resource.data)
-        && !('actualExcuse' in request.resource.data);
+        && !('actualExcuse' in request.resource.data)
+        && !('reviewedAt' in request.resource.data);
       allow update: if signedIn()
         && resource.data.ownerUid == request.auth.uid
         && request.resource.data.ownerUid == resource.data.ownerUid
