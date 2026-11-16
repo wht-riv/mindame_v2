@@ -1,6 +1,8 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, limit, query, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
-import { db, firebaseReady, ensureAnonymousUser, auth } from './firebase.js';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, limit, query, serverTimestamp, setDoc, Timestamp, updateDoc, where } from 'firebase/firestore';
+import { db, firebaseReady, ensureAnonymousUser } from './firebase.js';
+
+const APP_VERSION = '6.1.0';
 
 const EXCUSES = [
   '眠い・だるい',
@@ -28,63 +30,85 @@ const STEPS = [
   'タイマーを3分かける'
 ];
 
+const INTENTION_PRESETS = [
+  '机の上を片付けたい',
+  '洗濯物をしまいたい',
+  '食器を洗いたい',
+  'お風呂に入りたい',
+  '朝食を用意したい',
+  'ゴミをまとめたい'
+];
+
 const REACTIONS = [
   { id: 'wakaru', label: 'わかる', icon: '🤲' },
   { id: 'sankou', label: '参考になる', icon: '💡' },
   { id: 'dekisou', label: 'できそう', icon: '👣' }
 ];
 
+const LIMITS = { intention: 80, excuse: 60, step: 80 };
 const SK = 'mindameParticipantCodeV53';
 const clean = v => v.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 20);
+const uniq = xs => xs.filter((x, i, a) => x && a.indexOf(x) === i);
 
 // URL ?demo=1 でデモモード初期値を決定
 const urlDemo = new URLSearchParams(window.location.search).get('demo') === '1';
 
-const APP_VERSION = '2.1.0';
+// ---- 生活日（Asia/Tokyo・毎朝4:00境界）----
+const HOUR_MS = 60 * 60 * 1000;
+const jstDateFormat = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Tokyo' });
+// 0:00〜3:59 は前日の生活日
+const getLifeDate = (date = new Date()) => jstDateFormat.format(new Date(date.getTime() - 4 * HOUR_MS));
+const lifeDateToStart = lifeDate => new Date(`${lifeDate}T04:00:00+09:00`);
+const getLifeDayStart = (date = new Date()) => lifeDateToStart(getLifeDate(date));
+const getNextLifeDayStart = (date = new Date()) => new Date(getLifeDayStart(date).getTime() + 24 * HOUR_MS);
+const today = () => getLifeDate();
 
-// 朝4:00を日付の切り替え基準にする（生活日: YYYY-MM-DD）
-const getBusinessDate = (date = new Date()) => {
-  const shifted = new Date(date.getTime() - 4 * 60 * 60 * 1000);
-  return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Tokyo' }).format(shifted);
+const tsToMs = v => {
+  if (!v) return null;
+  if (typeof v.toMillis === 'function') return v.toMillis();
+  if (typeof v.seconds === 'number') return v.seconds * 1000;
+  const t = new Date(v).getTime();
+  return Number.isNaN(t) ? null : t;
 };
-const today = () => getBusinessDate(new Date());
 
-// 本番モード時：次の生活日の4:00を過ぎ、かつ作戦登録から6時間以上経過するまで振り返りをロック
-function isReviewLocked(record, demoMode) {
-  if (!record || demoMode) return false;
-  // 同じ生活日（今日）の場合はロック
-  if (record.recordDate && record.recordDate === today()) return true;
-
-  if (record.createdAt) {
-    const createdMs = record.createdAt.seconds
-      ? record.createdAt.seconds * 1000
-      : new Date(record.createdAt).getTime();
-    if (createdMs) {
-      // 条件1: 作戦登録から6時間以上経過しているか
-      const sixHoursMs = 6 * 60 * 60 * 1000;
-      if (Date.now() - createdMs < sixHoursMs) return true;
-
-      // 条件2: 作戦登録生活日の翌朝4:00 (JST) を過ぎているか
-      const jstDate = new Date(createdMs);
-      const shifted = new Date(jstDate.getTime() - 4 * 60 * 60 * 1000); // 4時間前にずらして生活日を計算
-      const y = shifted.getUTCFullYear();
-      const m = shifted.getUTCMonth();
-      const d = shifted.getUTCDate();
-      const unlockMs = Date.UTC(y, m, d + 1, 4 - 9, 0, 0); // 翌朝4:00 JST (= UTC前日19:00)
-      if (Date.now() < unlockMs) return true;
-    }
-  }
-  return false;
+// 振り返り可能時刻 = 「次の生活日の4:00」と「作戦登録から6時間後」の遅いほう
+function getReviewAvailableMs(record) {
+  const saved = tsToMs(record.reviewAvailableAt);
+  if (saved) return saved;
+  const created = tsToMs(record.createdAt);
+  const lifeDate = record.recordDate || (created ? getLifeDate(new Date(created)) : null);
+  if (!lifeDate) return null;
+  const next = lifeDateToStart(lifeDate).getTime() + 24 * HOUR_MS;
+  return created ? Math.max(next, created + 6 * HOUR_MS) : next;
 }
 
+function isReviewLocked(record, demoMode) {
+  if (!record || demoMode) return false;
+  const ms = getReviewAvailableMs(record);
+  return ms ? Date.now() < ms : false;
+}
+// ---- 旧データ互換 ----
+const normalizeOutcome = s => {
+  if (s === 'done' || s === 'acted') return 'done';
+  if (s === 'partial') return 'partial';
+  if (s === 'not_started' || s === 'not_done') return 'not_started';
+  return null; // changed / unknown / null は主要集計対象外
+};
+const intentionOf = r => (r && (r.dailyIntentionText || r.goalText)) || '登録された行動';
+const normalizeReactionType = t => (t === 'seed' ? 'dekisou' : t);
+
 export default function App() {
-  const sessionStartedAt = useMemo(() => new Date().toISOString(), []);
+  const sessionStart = useRef(new Date());
+  const reviewOpenedAt = useRef(null);
+  const reviewStartSaved = useRef(false);
   const [ready, setReady] = useState(false);
+  const [authFailed, setAuthFailed] = useState(false);
   const [uid, setUid] = useState('');
   const [code, setCode] = useState(localStorage.getItem(SK) || '');
   const [codeIn, setCodeIn] = useState('');
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [records, setRecords] = useState([]);
   const [posts, setPosts] = useState([]);
   const [tab, setTab] = useState('home');
@@ -96,17 +120,76 @@ export default function App() {
   const msg = t => { setToast(t); setTimeout(() => setToast(''), 2200) };
   const toggleDemo = () => setDemoMode(v => !v);
 
-  useEffect(() => { if (!firebaseReady) return; ensureAnonymousUser().then(u => { setUid(u.uid); setReady(true) }) }, []);
+  // エラーログ（個人情報・入力内容は保存しない。失敗しても再帰しない）
+  async function logError(errorType, operation, err) {
+    console.error('App error:', errorType, operation, err && err.code);
+    try {
+      if (!uid) return;
+      await addDoc(collection(db, 'systemErrorsV1'), {
+        uid,
+        participantCode: code || null,
+        errorType,
+        operation,
+        message: String((err && err.code) || 'unknown').slice(0, 60),
+        appVersion: APP_VERSION,
+        createdAt: serverTimestamp()
+      });
+    } catch (e) {
+      console.error('Error log failed:', e && e.code);
+    }
+  }
+
+  // イベントログ（必要最小限。once指定は生活日につき1回）
+  async function logEvent(eventType, extra = {}) {
+    try {
+      if (!uid || !code) return;
+      const recordDate = getLifeDate();
+      const data = {
+        participantCode: code,
+        eventType,
+        recordId: extra.recordId || null,
+        postId: extra.postId || null,
+        reactionType: extra.reactionType || null,
+        recordDate,
+        appVersion: APP_VERSION,
+        createdAt: serverTimestamp()
+      };
+      const col = collection(db, 'participantsV4', uid, 'events');
+      if (extra.once) {
+        const ref = doc(col, `${recordDate}_${eventType}`);
+        const exists = await getDoc(ref);
+        if (exists.exists()) return;
+        await setDoc(ref, data);
+      } else {
+        await addDoc(col, data);
+      }
+    } catch (e) {
+      console.error('Event log failed:', e && e.code);
+    }
+  }
+
+  useEffect(() => {
+    if (!firebaseReady) return;
+    ensureAnonymousUser()
+      .then(u => { setUid(u.uid); setReady(true) })
+      .catch(e => { console.error('Auth error:', e && e.code); setAuthFailed(true) });
+  }, []);
   useEffect(() => { if (ready && uid && code) loadAll() }, [ready, uid, code]);
   useEffect(() => { const f = () => { if (uid && code && !flow) loadAll() }; document.addEventListener('visibilitychange', f); return () => document.removeEventListener('visibilitychange', f) }, [uid, code, flow]);
+  useEffect(() => { if (profile && uid && code) logEvent('app_opened', { once: true }) }, [!!profile, uid, code]);
 
   async function loadAll() {
     setLoading(true);
-    const pr = doc(db, 'participantsV4', uid), ps = await getDoc(pr);
-    setProfile(ps.exists() ? ps.data() : null);
-    if (ps.exists()) {
-      const rs = await getDocs(collection(pr, 'records'));
-      setRecords(rs.docs.map(x => ({ id: x.id, ...x.data() })).sort((a, b) => (b.recordDate || '').localeCompare(a.recordDate || '')));
+    try {
+      const pr = doc(db, 'participantsV4', uid), ps = await getDoc(pr);
+      setProfile(ps.exists() ? ps.data() : null);
+      if (ps.exists()) {
+        const rs = await getDocs(collection(pr, 'records'));
+        setRecords(rs.docs.map(x => ({ id: x.id, ...x.data() })).sort((a, b) => (b.recordDate || '').localeCompare(a.recordDate || '')));
+      }
+    } catch (e) {
+      logError('read', 'loadAll', e);
+      msg('読み込めませんでした。');
     }
     setLoading(false);
   }
@@ -114,142 +197,237 @@ export default function App() {
   function enter() { const c = clean(codeIn); if (c.length < 3) return msg('参加コードを確認してください。'); localStorage.setItem(SK, c); setCode(c) }
 
   async function onboard(v) {
-    const d = { ...v, ownerUid: uid, participantCode: code, appVersion: APP_VERSION, customExcuses: v.excuses, savedFirstSteps: STEPS, sessionStartedAt, createdAt: serverTimestamp(), updatedAt: serverTimestamp() };
-    await setDoc(doc(db, 'participantsV4', uid), d);
-    setProfile(d);
+    try {
+      const base = {
+        ownerUid: uid,
+        participantCode: code,
+        customExcuses: v.excuses,
+        savedFirstSteps: STEPS,
+        appVersion: APP_VERSION
+      };
+      await setDoc(doc(db, 'participantsV4', uid), { ...base, consentedAt: serverTimestamp(), createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
+      setProfile(base);
+    } catch (e) {
+      logError('write', 'onboard', e);
+      msg('保存できませんでした。');
+    }
   }
 
   const pending = records.find(r => !r.outcomeStatus) || null;
-  const current = demoMode ? pending : (records.find(r => r.recordDate === today()) || null);
+  const todayRecord = records.find(r => r.recordDate === today()) || null;
+  const current = demoMode ? pending : todayRecord;
   const pendingLocked = isReviewLocked(pending, demoMode);
+  const planBlocked = !demoMode && !!todayRecord;
+
+  function openPlan() {
+    if (planBlocked) return;
+    setFlow('plan');
+    logEvent('plan_opened');
+  }
 
   async function savePlan(v) {
-    const lifeDay = today();
-    const id = demoMode ? `${lifeDay}-${Date.now()}` : lifeDay;
-    const ref = doc(db, 'participantsV4', uid, 'records', id);
-    if (!demoMode) {
-      const existing = await getDoc(ref);
-      if (existing.exists()) { msg('今日の作戦は記録済みです。'); setFlow(null); return loadAll() }
+    if (saving) return;
+    const intention = v.intention.trim(), excuse = v.excuse.trim(), step = v.step.trim();
+    if (!intention || intention.length > LIMITS.intention || !excuse || excuse.length > LIMITS.excuse || !step || step.length > LIMITS.step) return;
+    setSaving(true);
+    try {
+      const now = new Date();
+      const lifeDate = getLifeDate(now);
+      if (!demoMode && records.some(r => r.recordDate === lifeDate)) { msg('今日の作戦は記録済みです。'); setFlow(null); return; }
+      const id = demoMode ? `${lifeDate}-${now.getTime()}` : lifeDate;
+      const ref = doc(db, 'participantsV4', uid, 'records', id);
+      if (!demoMode) {
+        const existing = await getDoc(ref);
+        if (existing.exists()) { msg('今日の作戦は記録済みです。'); setFlow(null); await loadAll(); return; }
+      }
+      const savedExcuses = profile.customExcuses || [];
+      const pastIntentions = records.map(r => r.dailyIntentionText);
+      const pastSteps = records.map(r => r.firstStepText);
+      const dailyIntentionSource = pastIntentions.includes(intention) ? 'history' : INTENTION_PRESETS.includes(intention) ? 'preset' : 'custom';
+      const excuseSource = savedExcuses.includes(excuse) ? 'saved' : EXCUSES.includes(excuse) ? 'preset' : 'custom';
+      const stepSource = pastSteps.includes(step) ? 'history' : STEPS.includes(step) ? 'preset' : 'custom';
+      const sec = Math.floor((now.getTime() - sessionStart.current.getTime()) / 1000);
+      const sessionDurationSeconds = Number.isInteger(sec) && sec >= 0 && sec < 86400 ? sec : null;
+      const availMs = Math.max(getNextLifeDayStart(now).getTime(), now.getTime() + 6 * HOUR_MS);
+      const d = {
+        ownerUid: uid,
+        participantCode: code,
+        appVersion: APP_VERSION,
+        recordDate: lifeDate,
+        lifeDayStart: Timestamp.fromDate(getLifeDayStart(now)),
+        dailyIntentionText: intention,
+        dailyIntentionSource,
+        predictedExcuse: excuse,
+        excuseSource,
+        firstStepText: step,
+        stepSource,
+        outcomeStatus: null,
+        predictionMatched: null,
+        actualExcuse: null,
+        actualExcuseSource: null,
+        selfBlameAfterNotStarted: null,
+        sessionStartedAt: Timestamp.fromDate(sessionStart.current),
+        planStartedAt: Timestamp.fromDate(v.planStartedAt),
+        planCompletedAt: serverTimestamp(),
+        sessionDurationSeconds,
+        reviewAvailableAt: Timestamp.fromDate(new Date(availMs)),
+        reviewStartedAt: null,
+        reviewCompletedAt: null,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      };
+      await setDoc(ref, d);
+      const updates = { appVersion: APP_VERSION };
+      if (excuseSource === 'custom') updates.customExcuses = uniq([...savedExcuses, excuse]).slice(-20);
+      updates.savedFirstSteps = uniq([step, ...(profile.savedFirstSteps || [])]).slice(0, 20);
+      await updateDoc(doc(db, 'participantsV4', uid), { ...updates, updatedAt: serverTimestamp() });
+      setProfile(p => ({ ...p, ...updates }));
+      logEvent('plan_completed', { recordId: id });
+      await loadAll();
+      setShareDraft({ recordId: id, intention, excuse, step });
+      setFlow('publish');
+      msg('今日の作戦を記録しました。');
+    } catch (e) {
+      logError('write', 'savePlan', e);
+      msg('記録できませんでした。');
+    } finally {
+      setSaving(false);
     }
-    const excuseSource = EXCUSES.includes(v.excuse) ? 'preset' : 'custom';
-    const stepSource = STEPS.includes(v.step) ? 'preset' : 'custom';
-    const d = {
-      ownerUid: uid,
-      participantCode: code,
-      appVersion: APP_VERSION,
-      recordDate: lifeDay,
-      lifeDayStart: lifeDay,
-      predictedExcuse: v.excuse,
-      excuseSource,
-      firstStepText: v.step,
-      stepSource,
-      outcomeStatus: null,
-      sessionStartedAt,
-      planStartedAt: v.planStartedAt || null,
-      planCompletedAt: serverTimestamp(),
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
-    };
-    await setDoc(ref, d);
-    const updates = {};
-    if (v.newExcuse) updates.customExcuses = [...(profile.customExcuses || []), v.excuse].filter((x, i, a) => a.indexOf(x) === i).slice(-20);
-    updates.savedFirstSteps = [v.step, ...(profile.savedFirstSteps || [])].filter((x, i, a) => a.indexOf(x) === i).slice(0, 20);
-    await updateDoc(doc(db, 'participantsV4', uid), updates);
-    setProfile(p => ({ ...p, ...updates }));
-    await loadAll();
-    setShareDraft({ recordId: id, excuse: v.excuse, step: v.step });
-    setFlow('publish');
-    msg('今日の作戦を記録しました。');
   }
 
   async function publishExcuse(share) {
-    if (share) await addDoc(collection(db, 'publicPostsV4'), { ownerUid: uid, goalText: profile.goalText, excuseText: shareDraft.excuse, firstStepText: shareDraft.step, isVisible: true, createdAt: serverTimestamp() });
-    setShareDraft(null); setFlow(null); setTab('home'); if (share) msg('匿名で共有しました。');
+    try {
+      if (share && shareDraft) {
+        const ref = await addDoc(collection(db, 'publicPostsV4'), {
+          ownerUid: uid,
+          participantCode: code,
+          dailyIntentionText: shareDraft.intention,
+          goalText: shareDraft.intention,
+          excuseText: shareDraft.excuse,
+          firstStepText: shareDraft.step,
+          isVisible: true,
+          appVersion: APP_VERSION,
+          createdAt: serverTimestamp(),
+          hiddenAt: null
+        });
+        logEvent('post_shared', { recordId: shareDraft.recordId, postId: ref.id });
+        msg('匿名で共有しました。');
+      }
+    } catch (e) {
+      logError('share', 'publishExcuse', e);
+      msg('共有できませんでした。');
+    }
+    setShareDraft(null); setFlow(null); setTab('home');
+  }
+
+  async function openReview() {
+    if (!pending || pendingLocked) return;
+    setFlow('review');
+    reviewOpenedAt.current = new Date();
+    reviewStartSaved.current = !!pending.reviewStartedAt;
+    logEvent('review_opened', { recordId: pending.id });
+    if (!pending.reviewStartedAt) {
+      try {
+        await updateDoc(doc(db, 'participantsV4', uid, 'records', pending.id), { reviewStartedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+        reviewStartSaved.current = true;
+      } catch (e) {
+        logError('write', 'reviewStart', e);
+      }
+    }
   }
 
   async function saveReview(v) {
-    const ref = doc(db, 'participantsV4', uid, 'records', pending.id);
-    const reviewData = {
-      ...v,
-      sessionStartedAt,
-      reviewCompletedAt: serverTimestamp(),
-      reviewedAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
-    };
-    await updateDoc(ref, reviewData);
-    if (v.addActualToLibrary && v.actualExcuse) {
-      const xs = [...(profile.customExcuses || []), v.actualExcuse].filter((x, i, a) => a.indexOf(x) === i).slice(-20);
-      await updateDoc(doc(db, 'participantsV4', uid), { customExcuses: xs });
-      setProfile(p => ({ ...p, customExcuses: xs }));
+    if (saving || !pending) return;
+    const outcome = normalizeOutcome(v.outcomeStatus);
+    if (!outcome || !['done', 'partial', 'not_started'].includes(v.outcomeStatus)) return;
+    setSaving(true);
+    try {
+      const blame = outcome === 'not_started' && Number.isInteger(v.selfBlameAfterNotStarted) && v.selfBlameAfterNotStarted >= 1 && v.selfBlameAfterNotStarted <= 5 ? v.selfBlameAfterNotStarted : null;
+      const saved = profile.customExcuses || [];
+      const actual = v.predictionMatched === 'no' ? (v.actualExcuse || '').trim() : null;
+      const actualExcuseSource = actual ? (saved.includes(actual) ? 'saved' : EXCUSES.includes(actual) ? 'preset' : 'custom') : null;
+      const data = {
+        outcomeStatus: outcome,
+        predictionMatched: outcome === 'done' ? null : v.predictionMatched || null,
+        actualExcuse: actual || null,
+        actualExcuseSource,
+        selfBlameAfterNotStarted: blame,
+        reviewCompletedAt: serverTimestamp(),
+        reviewedAt: serverTimestamp(),
+        updatedAt: serverTimestamp()
+      };
+      if (!reviewStartSaved.current && reviewOpenedAt.current) data.reviewStartedAt = Timestamp.fromDate(reviewOpenedAt.current);
+      await updateDoc(doc(db, 'participantsV4', uid, 'records', pending.id), data);
+      if (v.addActualToLibrary && actual) {
+        const xs = uniq([...saved, actual]).slice(-20);
+        await updateDoc(doc(db, 'participantsV4', uid), { customExcuses: xs, updatedAt: serverTimestamp() });
+        setProfile(p => ({ ...p, customExcuses: xs }));
+      }
+      logEvent('review_completed', { recordId: pending.id });
+      await loadAll(); setFlow(null); setTab('home'); msg('振り返りを記録しました。');
+    } catch (e) {
+      logError('write', 'saveReview', e);
+      msg('記録できませんでした。');
+    } finally {
+      setSaving(false);
     }
-    await loadAll(); setFlow(null); setTab('home'); msg('振り返りを記録しました。');
   }
 
   async function loadCommunity() {
-    const currentUser = auth?.currentUser || (await ensureAnonymousUser());
-    const currentUid = currentUser?.uid || uid;
-    const snap = await getDocs(query(collection(db, 'publicPostsV4'), where('isVisible', '==', true), limit(50)));
-    const all = snap.docs.map(x => ({ id: x.id, ...x.data() }));
-    await Promise.all(all.map(async p => {
-      const reactions = await getDocs(collection(db, 'publicPostsV4', p.id, 'reactions'));
-      const counts = { wakaru: 0, sankou: 0, dekisou: 0 };
-      let myReaction = null;
-      reactions.docs.forEach(x => {
-        const d = x.data();
-        const type = d.type;
-        if (type && counts[type] !== undefined) counts[type]++;
-        if ((x.id === currentUid || d.ownerUid === currentUid) && type && counts[type] !== undefined) {
-          myReaction = type;
-        }
-      });
-      p.counts = counts;
-      p.myReaction = myReaction;
-    }));
-    setPosts(all.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)));
+    try {
+      const snap = await getDocs(query(collection(db, 'publicPostsV4'), where('isVisible', '==', true), limit(50)));
+      const all = snap.docs.map(x => ({ id: x.id, ...x.data() }));
+      await Promise.all(all.map(async p => {
+        const reactions = await getDocs(collection(db, 'publicPostsV4', p.id, 'reactions'));
+        const counts = { wakaru: 0, sankou: 0, dekisou: 0 };
+        let myReaction = null;
+        reactions.docs.forEach(x => {
+          const d = x.data();
+          const type = normalizeReactionType(d.type); // 旧seedはdekisouとして扱う
+          if (type && counts[type] !== undefined) counts[type]++;
+          if ((x.id === uid || d.ownerUid === uid) && type && counts[type] !== undefined) myReaction = type;
+        });
+        p.counts = counts;
+        p.myReaction = myReaction;
+      }));
+      setPosts(all.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0)));
+      logEvent('community_view', { once: true });
+    } catch (e) {
+      logError('read', 'loadCommunity', e);
+      msg('読み込めませんでした。');
+    }
   }
 
-  useEffect(() => { if (tab === 'community' && uid) loadCommunity() }, [tab, uid]);
+  useEffect(() => { if (tab === 'community' && uid && code) loadCommunity() }, [tab, uid, code]);
 
   async function react(post, reactionId) {
-    const currentUser = auth?.currentUser || (await ensureAnonymousUser());
-    const currentUid = currentUser?.uid || uid;
-    if (!currentUid) {
-      msg('認証が確認できませんでした。');
-      return;
-    }
-    const validTypes = ['wakaru', 'sankou', 'dekisou'];
-    if (!validTypes.includes(reactionId)) return;
+    if (!uid) { msg('認証が確認できませんでした。'); return; }
+    if (!REACTIONS.some(r => r.id === reactionId)) return;
 
     const prevMyReaction = post.myReaction;
     const prevCounts = { ...(post.counts || { wakaru: 0, sankou: 0, dekisou: 0 }) };
-
     const isSame = prevMyReaction === reactionId;
     const nextMyReaction = isSame ? null : reactionId;
     const nextCounts = { ...prevCounts };
-    if (prevMyReaction && nextCounts[prevMyReaction] !== undefined) {
-      nextCounts[prevMyReaction] = Math.max(0, (nextCounts[prevMyReaction] || 0) - 1);
-    }
-    if (!isSame && nextCounts[reactionId] !== undefined) {
-      nextCounts[reactionId] = (nextCounts[reactionId] || 0) + 1;
-    }
+    if (prevMyReaction && nextCounts[prevMyReaction] !== undefined) nextCounts[prevMyReaction] = Math.max(0, (nextCounts[prevMyReaction] || 0) - 1);
+    if (!isSame && nextCounts[reactionId] !== undefined) nextCounts[reactionId] = (nextCounts[reactionId] || 0) + 1;
 
     // 楽観的UI更新
     setPosts(list => list.map(p => p.id === post.id ? { ...p, counts: nextCounts, myReaction: nextMyReaction } : p));
 
-    const ref = doc(db, 'publicPostsV4', post.id, 'reactions', currentUid);
+    const ref = doc(db, 'publicPostsV4', post.id, 'reactions', uid);
     try {
       if (isSame) {
         await deleteDoc(ref);
       } else {
-        await setDoc(ref, {
-          ownerUid: currentUid,
-          type: reactionId,
-          updatedAt: serverTimestamp()
-        });
+        const data = { ownerUid: uid, type: reactionId, updatedAt: serverTimestamp() };
+        if (!prevMyReaction) data.createdAt = serverTimestamp();
+        await setDoc(ref, data, { merge: true });
       }
+      logEvent(isSame ? 'reaction_removed' : prevMyReaction ? 'reaction_changed' : 'reaction_added', { postId: post.id, reactionType: reactionId });
     } catch (err) {
-      console.error('Reaction error:', err.code, err.message, err);
-      // ロールバック
+      console.error('Reaction error:', err.code, err.message);
+      logError('reaction', 'react', err);
       setPosts(list => list.map(p => p.id === post.id ? { ...p, counts: prevCounts, myReaction: prevMyReaction } : p));
       msg('リアクションを保存できませんでした。');
     }
@@ -257,22 +435,31 @@ export default function App() {
 
   async function hidePost(post) {
     if (post.ownerUid !== uid) return;
-    await updateDoc(doc(db, 'publicPostsV4', post.id), { isVisible: false });
-    await loadCommunity();
+    try {
+      await updateDoc(doc(db, 'publicPostsV4', post.id), { isVisible: false, hiddenAt: serverTimestamp() });
+      logEvent('post_hidden', { postId: post.id });
+      await loadCommunity();
+    } catch (e) {
+      logError('write', 'hidePost', e);
+      msg('取り消せませんでした。');
+    }
   }
 
-  if (!firebaseReady) return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><Card><h1>Firebase設定を確認してください</h1></Card></Shell>;
-  if (!ready) return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><Loading /></Shell>;
-  if (!code) return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><Entry value={codeIn} setValue={setCodeIn} enter={enter} /></Shell>;
-  if (loading) return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><Loading /></Shell>;
-  if (!profile) return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><Onboard submit={onboard} /></Shell>;
-  if (flow === 'plan') return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><Plan profile={profile} records={records} previous={records[0]?.predictedExcuse} save={savePlan} back={() => setFlow(null)} /></Shell>;
-  if (flow === 'publish' && shareDraft) return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><PublicExcuse draft={shareDraft} profile={profile} publish={publishExcuse} /></Shell>;
-  if (flow === 'review' && pending && !pendingLocked) return <Shell demoMode={demoMode} toggleDemo={toggleDemo}><Review item={pending} profile={profile} save={saveReview} back={() => setFlow(null)} /></Shell>;
+  const shell = (children, extra = {}) => <Shell demoMode={demoMode} toggleDemo={toggleDemo} {...extra}>{children}</Shell>;
+
+  if (!firebaseReady) return shell(<Card><h1>Firebase設定を確認してください</h1></Card>);
+  if (authFailed) return shell(<Card><h1>接続できませんでした</h1><p className="muted">時間をおいて再読み込みしてください。</p></Card>);
+  if (!ready) return shell(<Loading />);
+  if (!code) return shell(<Entry value={codeIn} setValue={setCodeIn} enter={enter} />);
+  if (loading) return shell(<Loading />);
+  if (!profile) return shell(<Onboard submit={onboard} />);
+  if (flow === 'plan') return shell(<Plan profile={profile} records={records} save={savePlan} saving={saving} back={() => setFlow(null)} />);
+  if (flow === 'publish' && shareDraft) return shell(<PublicExcuse draft={shareDraft} publish={publishExcuse} />);
+  if (flow === 'review' && pending && !pendingLocked) return shell(<Review item={pending} profile={profile} save={saveReview} saving={saving} back={() => setFlow(null)} />);
   return (
     <Shell demoMode={demoMode} toggleDemo={toggleDemo} profile={profile} toast={toast}>
       <div className="page">
-        {tab === 'home' && <Home pending={pending} pendingLocked={pendingLocked} current={current} records={records} review={() => setFlow('review')} plan={() => setFlow('plan')} />}
+        {tab === 'home' && <Home pending={pending} pendingLocked={pendingLocked} current={current} planBlocked={planBlocked} records={records} review={openReview} plan={openPlan} />}
         {tab === 'excuses' && <MyRecords records={records} profile={profile} />}
         {tab === 'community' && <Community posts={posts} uid={uid} react={react} hidePost={hidePost} />}
       </div>
@@ -281,7 +468,7 @@ export default function App() {
   );
 }
 
-function Shell({ children, demoMode, toggleDemo, profile, toast }) {
+function Shell({ children, demoMode, toggleDemo, toast }) {
   return (
     <div className="shell">
       <header>
@@ -302,9 +489,9 @@ function Loading() { return <div className="center"><div className="loader" /><p
 function Entry({ value, setValue, enter }) {
   return (
     <div className="entry">
-      <p className="eyebrow">言い訳と最初の一歩。</p>
+      <p className="eyebrow">言い訳と最初の一歩</p>
       <h1>みんだめ</h1>
-      <label>参加コード<input value={value} onChange={e => setValue(e.target.value)} placeholder="例：MD-001" /></label>
+      <label>参加番号<input value={value} onChange={e => setValue(e.target.value)} placeholder="例：MD-001" /></label>
       <button className="primary" onClick={enter}>はじめる</button>
       <small>本名や学籍番号は入力しないでください。</small>
     </div>
@@ -312,25 +499,21 @@ function Entry({ value, setValue, enter }) {
 }
 
 function Onboard({ submit }) {
-  const [goal, setGoal] = useState('');
   const [xs, setXs] = useState([]);
   const [extra, setExtra] = useState('');
   const [ok, setOk] = useState(false);
   const toggle = x => setXs(a => a.includes(x) ? a.filter(v => v !== x) : a.length < 3 ? [...a, x] : a);
-  const add = () => { const x = extra.trim(); if (x && xs.length < 3 && !xs.includes(x)) { setXs(a => [...a, x]); setExtra('') } };
+  const add = () => { const x = extra.trim().slice(0, LIMITS.excuse); if (x && xs.length < 3 && !xs.includes(x)) { setXs(a => [...a, x]); setExtra('') } };
   return (
     <div className="stack">
       <h1>最初の設定</h1>
       <Card>
+        <p>毎日、その日に少し整えたいことを1つ決めます。同じことでも別のことでもかまいません。</p>
+      </Card>
+      <Card>
         <label className="check">
           <input type="checkbox" checked={ok} onChange={e => setOk(e.target.checked)} />
           操作記録を研究データとして利用する説明を読み、同意します
-        </label>
-      </Card>
-      <Card>
-        <h2>後回しにしがちなこと（やりたいこと）</h2>
-        <label>
-          <input value={goal} onChange={e => setGoal(e.target.value)} placeholder="例：机の上を片付ける・2時までに布団に入る・お風呂に入る" />
         </label>
       </Card>
       <Card>
@@ -345,7 +528,7 @@ function Onboard({ submit }) {
           ))}
         </div>
         <div className="add-row">
-          <input value={extra} onChange={e => setExtra(e.target.value)} placeholder="自分の言い訳を書く" maxLength={60} />
+          <input value={extra} onChange={e => setExtra(e.target.value)} placeholder="自分の言い訳を書く" maxLength={LIMITS.excuse} />
           <button type="button" className="secondary" disabled={!extra.trim() || xs.length >= 3} onClick={add}>追加</button>
         </div>
         {xs.length > 0 && (
@@ -354,20 +537,30 @@ function Onboard({ submit }) {
           </div>
         )}
       </Card>
-      <button className="primary" disabled={!ok || !goal || xs.length < 1 || xs.length > 3} onClick={() => submit({ goalText: goal, excuses: xs })}>設定を保存</button>
+      <button className="primary" disabled={!ok || xs.length < 1 || xs.length > 3} onClick={() => submit({ excuses: xs })}>設定を保存</button>
     </div>
   );
 }
 
-function Home({ pending, pendingLocked, current, records, review, plan }) {
+function TripleCard({ intention, excuse, step }) {
+  return (
+    <>
+      <p className="pair"><span>少し整えたいこと</span><b>{intention}</b></p>
+      <p className="pair"><span>できなさそうな理由</span><b>{excuse}</b></p>
+      <p className="pair"><span>それでもできそうな一歩</span><b>{step}</b></p>
+      <p className="plan-sentence">「{excuse}」と思う日でも、<br /><strong>{step}</strong>ならできるかも。</p>
+    </>
+  );
+}
+
+function Home({ pending, pendingLocked, current, planBlocked, records, review, plan }) {
   const stats = useMemo(() => {
     let moved = 0, match = 0, other = 0;
     records.forEach(r => {
-      const isMoved = r.outcomeStatus === 'done' || r.outcomeStatus === 'partial' || r.outcomeStatus === 'acted';
-      const isNotDone = r.outcomeStatus === 'not_started' || r.outcomeStatus === 'not_done';
-      if (isMoved) moved++;
-      else if (isNotDone && r.predictionMatched === 'yes') match++;
-      else if (isNotDone && r.predictionMatched === 'no') other++;
+      const o = normalizeOutcome(r.outcomeStatus);
+      if (o === 'done' || o === 'partial') moved++;
+      else if (o === 'not_started' && r.predictionMatched === 'yes') match++;
+      else if (o === 'not_started' && r.predictionMatched === 'no') other++;
     });
     return { moved, match, other, total: moved + match + other };
   }, [records]);
@@ -381,10 +574,10 @@ function Home({ pending, pendingLocked, current, records, review, plan }) {
         <h2>振り返り</h2>
         {pending ? (
           <>
-            <p className="pair"><span>予測</span><b>{pending.predictedExcuse}</b></p>
-            <p className="pair"><span>最初の一歩</span><b>{pending.firstStepText}</b></p>
+            <p className="pair"><span>整えたいこと</span><b>{intentionOf(pending)}</b></p>
+            <p className="pair"><span>決めた一歩</span><b>{pending.firstStepText}</b></p>
             {pendingLocked
-              ? <p className="muted">振り返りは翌朝4:00（かつ作戦登録から6時間経過後）からできます。</p>
+              ? <p className="muted">振り返りは翌朝4:00からできます。</p>
               : <button className="primary" onClick={review}>振り返る</button>}
           </>
         ) : (
@@ -392,18 +585,16 @@ function Home({ pending, pendingLocked, current, records, review, plan }) {
         )}
       </Card>
       <Card>
-        <h2>今日の予測・作戦</h2>
+        <h2>今日の作戦</h2>
         {current ? (
           <>
-            <p className="plan-sentence">「{current.predictedExcuse}」と感じる日でも、<br /><strong>{current.firstStepText}</strong>ならできるかも。</p>
+            <TripleCard intention={intentionOf(current)} excuse={current.predictedExcuse} step={current.firstStepText} />
             <span className="done">記録済み</span>
           </>
         ) : (
-          <>
-            <p>今日使いそうな言い訳を先に認識し、その状態でもできそうな一歩を決めます。</p>
-            <button className="primary" onClick={plan}>今日の作戦を考える</button>
-          </>
+          <p>今日少し整えたいこと、できなさそうな理由、それでもできそうな一歩を決めます。</p>
         )}
+        <button className="primary" disabled={planBlocked} onClick={plan}>{planBlocked ? '今日の作戦は登録済みです' : '今日の作戦を考える'}</button>
       </Card>
       <Pattern stats={stats} />
     </div>
@@ -429,92 +620,77 @@ function Pattern({ stats }) {
   );
 }
 
-function Plan({ profile, records, previous, save, back }) {
-  const [planStartedAt] = useState(() => new Date().toISOString());
-  const [e, setE] = useState('');
-  const [other, setOther] = useState('');
-  const [step, setStep] = useState('');
-  const [custom, setCustom] = useState('');
-  const [confirm, setConfirm] = useState(false);
-  const opts = [...new Set(profile.customExcuses || [])];
-  const excuse = other.trim() || e;
-  const first = custom.trim() || step;
-  const repeated = excuse && excuse === previous;
-  const stepStats = useMemo(() => {
-    const map = {};
-    records.forEach((r, i) => {
-      if (!r.firstStepText) return;
-      const o = map[r.firstStepText] || { text: r.firstStepText, count: 0, last: 0 };
-      o.count++;
-      o.last = Math.max(o.last, Number((r.createdAt?.seconds || 0) * 1000) || records.length - i);
-      map[r.firstStepText] = o;
-    });
-    return Object.values(map);
-  }, [records]);
-  const recent = [...stepStats].sort((a, b) => b.last - a.last).slice(0, 3).map(x => x.text);
-  const frequent = [...stepStats].sort((a, b) => b.count - a.count || b.last - a.last).map(x => x.text).filter(x => !recent.includes(x)).slice(0, 3);
-  const recommended = [...new Set(STEPS)].filter(x => !recent.includes(x) && !frequent.includes(x)).slice(0, 4);
-  const StepGroup = ({ title, items }) => items.length ? (
-    <div className="step-group">
-      <h3>{title}</h3>
-      <div className="choices">
-        {items.map(x => <button key={x} type="button" className={step === x ? 'choice on' : 'choice'} onClick={() => { setStep(x); setCustom('') }}>{x}</button>)}
+function ChipPick({ title, hint, items, value, setValue, maxLength, placeholder }) {
+  return (
+    <Card>
+      <h2>{title}</h2>
+      {hint && <p className="muted">{hint}</p>}
+      <div className="chips">
+        {items.map(x => <button key={x} type="button" className={value === x ? 'chip on' : 'chip'} onClick={() => setValue(x)}>{x}</button>)}
       </div>
-    </div>
-  ) : null;
+      <label>
+        自分で書く
+        <input value={value} onChange={e => setValue(e.target.value)} maxLength={maxLength} placeholder={placeholder} />
+      </label>
+    </Card>
+  );
+}
+
+function Plan({ profile, records, save, saving, back }) {
+  const [planStartedAt] = useState(() => new Date());
+  const [intention, setIntention] = useState('');
+  const [excuse, setExcuse] = useState('');
+  const [step, setStep] = useState('');
+  const pastIntentions = uniq(records.map(r => r.dailyIntentionText)).slice(0, 5);
+  const pastSteps = uniq(records.map(r => r.firstStepText)).slice(0, 3);
+  const intentionItems = uniq([...pastIntentions, ...INTENTION_PRESETS]);
+  const excuseItems = uniq([...(profile.customExcuses || []), ...EXCUSES]);
+  const stepItems = uniq([...pastSteps, ...STEPS]);
+  const i = intention.trim(), e = excuse.trim(), s = step.trim();
+  const valid = i && i.length <= LIMITS.intention && e && e.length <= LIMITS.excuse && s && s.length <= LIMITS.step;
   return (
     <div className="stack">
       <button className="back" onClick={back}>← ホームへ</button>
-      <h1>今日の予測・作戦</h1>
-      <Card>
-        <h2>今日、使いそうな言い訳は？</h2>
-        <div className="chips">
-          {opts.map(x => (
-            <button key={x} type="button" className={e === x ? 'chip on' : 'chip'} onClick={() => { setE(x); setOther(''); setConfirm(false) }}>
-              {x}{x === previous && <small>前回も使用</small>}
-            </button>
-          ))}
-        </div>
-        <label>新しい言い訳を追加<input value={other} onChange={x => { setOther(x.target.value); setE('') }} /></label>
-        {repeated && !confirm && (
-          <div className="notice">
-            <p>前回も「{excuse}」でした。</p>
-            <button type="button" className="secondary" onClick={() => setConfirm(true)}>同じ理由で記録</button>
-          </div>
-        )}
-      </Card>
-      {excuse && (!repeated || confirm || other) && (
+      <h1>今日の作戦</h1>
+      <ChipPick
+        title="今日、生活の中で、少し整えたいと思うことは？"
+        hint="今日一日の中で、着手できたかを確認できることを書いてください。"
+        items={intentionItems} value={intention} setValue={setIntention}
+        maxLength={LIMITS.intention} placeholder="例：机の上を片付けたい"
+      />
+      <ChipPick
+        title="今日、それができなさそうなのはなぜ？"
+        items={excuseItems} value={excuse} setValue={setExcuse}
+        maxLength={LIMITS.excuse} placeholder="例：時間がない"
+      />
+      <ChipPick
+        title="その理由があっても、何ならできそう？"
+        hint="できたかどうかが分かる、小さな動作にしてください。"
+        items={stepItems} value={step} setValue={setStep}
+        maxLength={LIMITS.step} placeholder="例：ゴミを1つ捨てる"
+      />
+      {valid && (
         <Card>
-          <h2>「{excuse}」と感じる日でも、これならできるかも、と思う一歩は？</h2>
-          <StepGroup title="最近使ったもの" items={recent} />
-          <StepGroup title="よく使うもの" items={frequent} />
-          <StepGroup title="おすすめ" items={recommended} />
-          <label>
-            自分で書く
-            <input value={custom} onChange={x => { setCustom(x.target.value); setStep('') }} placeholder="例：ゴミを1つ捨てる" />
-            <small>できたかどうかが分かる、小さな動作にしてください。</small>
-          </label>
+          <h2>確認</h2>
+          <TripleCard intention={i} excuse={e} step={s} />
         </Card>
       )}
-      <button className="primary" disabled={!excuse || !first || (repeated && !confirm)} onClick={() => save({ excuse, step: first, newExcuse: !!other.trim(), planStartedAt })}>記録する</button>
+      <button className="primary" disabled={!valid || saving} onClick={() => save({ intention, excuse, step, planStartedAt })}>記録する</button>
     </div>
   );
 }
 
-function PublicExcuse({ draft, profile, publish }) {
+function PublicExcuse({ draft, publish }) {
   return (
     <div className="stack">
-      <p className="eyebrow">お楽しみ・任意</p>
-      <h1>今日の予測・作戦を共有する？</h1>
+      <p className="eyebrow">記録しました</p>
+      <h1>今日の作戦</h1>
       <Card>
+        <TripleCard intention={draft.intention} excuse={draft.excuse} step={draft.step} />
+      </Card>
+      <Card>
+        <h2>匿名で共有する？（任意）</h2>
         <p className="muted">参加者に匿名で表示されます。個人が分かる内容が含まれていないか確認してください。</p>
-        <div className="share-context">
-          <strong>{profile.goalText}</strong>
-        </div>
-        <div className="share-preview">
-          <span>共有される作戦</span>
-          <p className="plan-sentence compact">「{draft.excuse}」と感じる日でも、<br /><strong>{draft.step}</strong>ならできるかも。</p>
-        </div>
       </Card>
       <button className="primary" onClick={() => publish(true)}>匿名で共有する</button>
       <button className="secondary" onClick={() => publish(false)}>共有しない</button>
@@ -522,103 +698,83 @@ function PublicExcuse({ draft, profile, publish }) {
   );
 }
 
-function Review({ item, profile, save, back }) {
-  const [reviewStartedAt] = useState(() => new Date().toISOString());
+function Review({ item, profile, save, saving, back }) {
   const [status, setStatus] = useState('');
-  const [continued, setContinued] = useState(false);
   const [match, setMatch] = useState('');
   const [actual, setActual] = useState('');
   const [addActual, setAddActual] = useState(true);
-  const [selfBlame, setSelfBlame] = useState(null);
-  const actualOptions = [...new Set([...(profile.customExcuses || []), ...EXCUSES])];
-
+  const [blame, setBlame] = useState(null);
+  const actualOptions = uniq([...(profile.customExcuses || []), ...EXCUSES]);
+  const asked = status === 'partial' || status === 'not_started';
   const canSave = status && (
     status === 'done' ||
-    status === 'partial' ||
-    (status === 'not_started' && match && selfBlame !== null && (match !== 'no' || actual.trim()))
+    (match && (match !== 'no' || actual.trim()) && (status !== 'not_started' || blame !== null))
   );
-
+  const choose = v => { setStatus(v); setMatch(''); setActual(''); setBlame(null); };
   return (
     <div className="stack">
       <button className="back" onClick={back}>← ホームへ</button>
       <h1>振り返り</h1>
       <Card>
-        <p className="pair"><span>予測</span><b>{item.predictedExcuse}</b></p>
-        <p className="pair"><span>最初の一歩</span><b>{item.firstStepText}</b></p>
+        <p className="pair"><span>昨日の整えたいこと</span><b>{intentionOf(item)}</b></p>
+        <p className="pair"><span>決めた一歩</span><b>{item.firstStepText}</b></p>
       </Card>
       <Card>
-        <h2>できましたか？</h2>
+        <h2>前回決めた一歩は、どこまでできましたか？</h2>
         <div className="choices">
-          <button type="button" className={status === 'done' ? 'choice on' : 'choice'} onClick={() => setStatus('done')}>できた</button>
-          <button type="button" className={status === 'partial' ? 'choice on' : 'choice'} onClick={() => setStatus('partial')}>少しだけやった（一部できた）</button>
-          <button type="button" className={status === 'not_started' ? 'choice on' : 'choice'} onClick={() => setStatus('not_started')}>着手しなかった</button>
+          <button type="button" className={status === 'done' ? 'choice on' : 'choice'} onClick={() => choose('done')}>完了した</button>
+          <button type="button" className={status === 'partial' ? 'choice on' : 'choice'} onClick={() => choose('partial')}>途中まで行った</button>
+          <button type="button" className={status === 'not_started' ? 'choice on' : 'choice'} onClick={() => choose('not_started')}>着手しなかった</button>
         </div>
+
       </Card>
-      {status === 'done' && (
+      {asked && (
         <Card>
-          <h2>どこまで進みましたか？</h2>
+          <h2>できなかった理由に「{item.predictedExcuse}」は当てはまりましたか？</h2>
           <div className="choices">
-            <button type="button" className={!continued ? 'choice on' : 'choice'} onClick={() => setContinued(false)}>決めた一歩まで</button>
-            <button type="button" className={continued ? 'choice on' : 'choice'} onClick={() => setContinued(true)}>その先も続けた</button>
+            <button type="button" className={match === 'yes' ? 'choice on' : 'choice'} onClick={() => setMatch('yes')}>当てはまった</button>
+            <button type="button" className={match === 'no' ? 'choice on' : 'choice'} onClick={() => setMatch('no')}>別の理由だった</button>
+            <button type="button" className={match === 'unknown' ? 'choice on' : 'choice'} onClick={() => setMatch('unknown')}>よく分からない</button>
           </div>
+          {match === 'no' && (
+            <>
+              <h3>実際には、どの理由が近かったですか？</h3>
+              <div className="chips">
+                {actualOptions.map(x => <button key={x} type="button" className={actual === x ? 'chip on' : 'chip'} onClick={() => setActual(x)}>{x}</button>)}
+              </div>
+              <label>ほかの理由<input value={actual} maxLength={LIMITS.excuse} onChange={e => setActual(e.target.value)} placeholder="例：時間がなかった" /></label>
+              <label className="check">
+                <input type="checkbox" checked={addActual} onChange={e => setAddActual(e.target.checked)} />
+                この理由を言い訳集にも追加する
+              </label>
+            </>
+          )}
         </Card>
       )}
       {status === 'not_started' && (
-        <>
-          <Card>
-            <h2>できなかった理由に「{item.predictedExcuse}」は当てはまりましたか？</h2>
-            <div className="choices">
-              <button type="button" className={match === 'yes' ? 'choice on' : 'choice'} onClick={() => setMatch('yes')}>当てはまった</button>
-              <button type="button" className={match === 'no' ? 'choice on' : 'choice'} onClick={() => setMatch('no')}>別の理由だった</button>
-              <button type="button" className={match === 'unknown' ? 'choice on' : 'choice'} onClick={() => setMatch('unknown')}>よく分からない</button>
-            </div>
-            {match === 'no' && (
-              <>
-                <h3>実際には、どの理由が近かったですか？</h3>
-                <div className="chips">
-                  {actualOptions.map(x => <button key={x} type="button" className={actual === x ? 'chip on' : 'chip'} onClick={() => setActual(x)}>{x}</button>)}
-                </div>
-                <label>ほかの理由<input value={actual} onChange={e => setActual(e.target.value)} placeholder="例：時間がなかった" /></label>
-                <label className="check">
-                  <input type="checkbox" checked={addActual} onChange={e => setAddActual(e.target.checked)} />
-                  この理由を言い訳集にも追加する
-                </label>
-              </>
-            )}
-          </Card>
-          <Card>
-            <h2>今回できなかったことで、自分を責める気持ちはありますか？</h2>
-            <p className="muted">1（全くない）〜 5（とてもある）でお答えください。</p>
-            <div className="scale-buttons">
-              {[1, 2, 3, 4, 5].map(num => (
-                <button
-                  key={num}
-                  type="button"
-                  className={selfBlame === num ? 'choice on' : 'choice'}
-                  onClick={() => setSelfBlame(num)}
-                >
-                  {num}
-                </button>
-              ))}
-            </div>
-            <div className="scale-labels">
-              <small>1: 全くない</small>
-              <small>5: とてもある</small>
-            </div>
-          </Card>
-        </>
+        <Card>
+          <h2>今回できなかったことで、自分を責める気持ちはありますか？</h2>
+          <p className="muted">1（全くない）〜 5（とてもある）でお答えください。</p>
+          <div className="scale-buttons">
+            {[1, 2, 3, 4, 5].map(n => (
+              <button key={n} type="button" className={blame === n ? 'choice on' : 'choice'} onClick={() => setBlame(n)}>{n}</button>
+            ))}
+          </div>
+          <div className="scale-labels">
+            <small>1: 全くない</small>
+            <small>5: とてもある</small>
+          </div>
+        </Card>
       )}
       <button
         className="primary"
-        disabled={!canSave}
+        disabled={!canSave || saving}
         onClick={() => save({
           outcomeStatus: status,
-          continuedBeyondFirstStep: status === 'done' && continued,
-          predictionMatched: status === 'not_started' ? match : null,
-          actualExcuse: status === 'not_started' ? (match === 'yes' ? item.predictedExcuse : match === 'no' ? actual.trim() : null) : null,
-          addActualToLibrary: status === 'not_started' && match === 'no' && addActual,
-          selfBlameScore: status === 'not_started' ? selfBlame : null,
-          reviewStartedAt
+          predictionMatched: asked ? match : null,
+          actualExcuse: match === 'no' ? actual.trim() : null,
+          selfBlameAfterNotStarted: status === 'not_started' ? blame : null,
+          addActualToLibrary: match === 'no' && addActual
         })}
       >保存する</button>
     </div>
@@ -648,8 +804,7 @@ function ReasonList({ records, profile }) {
     (profile.customExcuses || []).forEach(x => { if (x) map[x] = 0 });
     const add = x => { if (!x) return; map[x] = (map[x] || 0) + 1 };
     records.forEach(r => {
-      const isNotDone = r.outcomeStatus === 'not_started' || r.outcomeStatus === 'not_done';
-      if (!isNotDone) return;
+      if (normalizeOutcome(r.outcomeStatus) !== 'not_started') return;
       if (r.predictionMatched === 'yes') add(r.predictedExcuse);
       if (r.predictionMatched === 'no') add(r.actualExcuse);
     });
@@ -673,9 +828,9 @@ function StepList({ records }) {
       if (!r.firstStepText) return;
       const x = map[r.firstStepText] || { name: r.firstStepText, setCount: 0, doneCount: 0, continuedCount: 0, last: 0, excuses: {} };
       x.setCount++;
-      x.last = Math.max(x.last, r.createdAt?.seconds || records.length - i);
-      const isDone = r.outcomeStatus === 'done' || r.outcomeStatus === 'partial' || r.outcomeStatus === 'acted';
-      if (isDone) {
+      x.last = Math.max(x.last, (tsToMs(r.createdAt) || 0) / 1000 || records.length - i);
+      const o = normalizeOutcome(r.outcomeStatus);
+      if (o === 'done' || o === 'partial') {
         x.doneCount++;
         if (r.continuedBeyondFirstStep) x.continuedCount++;
         if (r.predictedExcuse) x.excuses[r.predictedExcuse] = (x.excuses[r.predictedExcuse] || 0) + 1;
@@ -697,7 +852,7 @@ function StepList({ records }) {
             <div className="step-stats">
               <span>設定した <b>{x.setCount}</b></span>
               <span>できた <b>{x.doneCount}</b></span>
-              <span>その先も続いた <b>{x.continuedCount}</b></span>
+              {x.continuedCount > 0 && <span>その先も続いた <b>{x.continuedCount}</b></span>}
             </div>
             {x.topExcuses.length > 0 && (
               <div className="excuse-links">
@@ -729,14 +884,15 @@ function Community({ posts, uid, react, hidePost }) {
 }
 
 function Post({ post, uid, react, hidePost }) {
+  const title = post.dailyIntentionText || post.goalText || '—';
   return (
     <Card className="post">
       <div className="post-head">
-        <strong title={post.goalText || ''}>{post.goalText || '—'}</strong>
+        <strong title={title}>{title}</strong>
         {post.ownerUid === uid && <small className="yours">あなたの記録</small>}
       </div>
       <div className="community-plan sentence">
-        <p>「{post.excuseText}」と感じる日でも、<br /><strong>{post.firstStepText || '最初の一歩は未登録'}</strong>ならできるかも。</p>
+        <p>「{post.excuseText}」と思う日でも、<br /><strong>{post.firstStepText || '最初の一歩は未登録'}</strong>ならできるかも。</p>
       </div>
       <div className="reacts">
         {REACTIONS.map(r => (

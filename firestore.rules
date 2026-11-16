@@ -4,6 +4,7 @@ service cloud.firestore {
     function signedIn() { return request.auth != null; }
     function mine(uid) { return signedIn() && request.auth.uid == uid; }
     function shortText(value, max) { return value is string && value.size() > 0 && value.size() <= max; }
+    function optShort(data, field, max) { return !(field in data) || shortText(data[field], max); }
 
     match /participantsV4/{uid} {
       allow get: if mine(uid);
@@ -16,8 +17,17 @@ service cloud.firestore {
         allow create: if mine(uid)
           && request.resource.data.ownerUid == uid
           && shortText(request.resource.data.predictedExcuse, 100)
-          && shortText(request.resource.data.firstStepText, 100);
+          && shortText(request.resource.data.firstStepText, 100)
+          && optShort(request.resource.data, 'dailyIntentionText', 80);
         allow update: if mine(uid) && resource.data.ownerUid == uid && request.resource.data.ownerUid == uid;
+        allow delete: if false;
+      }
+
+      match /events/{eventId} {
+        allow get, list: if mine(uid);
+        allow create, update: if mine(uid)
+          && request.resource.data.eventType is string
+          && request.resource.data.eventType.size() <= 40;
         allow delete: if false;
       }
     }
@@ -27,24 +37,38 @@ service cloud.firestore {
       allow create: if signedIn()
         && request.resource.data.ownerUid == request.auth.uid
         && request.resource.data.isVisible == true
-        && shortText(request.resource.data.excuseText, 100);
+        && shortText(request.resource.data.excuseText, 100)
+        && optShort(request.resource.data, 'dailyIntentionText', 80)
+        && !('selfBlameAfterNotStarted' in request.resource.data)
+        && !('actualExcuse' in request.resource.data);
       allow update: if signedIn()
         && resource.data.ownerUid == request.auth.uid
         && request.resource.data.ownerUid == resource.data.ownerUid
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isVisible']);
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isVisible', 'hiddenAt']);
       allow delete: if false;
 
+      // reactions/{uid}: 1人1投稿1種類（旧 type:'seed' は読み取りのみ）
       match /reactions/{uid} {
         allow get, list: if signedIn();
         allow create, update: if mine(uid)
           && request.resource.data.ownerUid == uid
-          && request.resource.data.type in ['wakaru', 'sankou', 'dekisou'];
+          && request.resource.data.type in ['wakaru', 'sankou', 'dekisou']
+          && request.resource.data.keys().hasOnly(['ownerUid', 'type', 'createdAt', 'updatedAt']);
         allow delete: if mine(uid);
       }
 
       match /replies/{uid} {
         allow read, write: if false;
       }
+    }
+
+    // エラーログ: 作成のみ可（一般ユーザーは読み取り不可）
+    match /systemErrorsV1/{errorId} {
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.keys().hasOnly(['uid', 'participantCode', 'errorType', 'operation', 'message', 'appVersion', 'createdAt'])
+        && request.resource.data.errorType in ['auth', 'read', 'write', 'share', 'reaction'];
+      allow read, update, delete: if false;
     }
   }
 }
