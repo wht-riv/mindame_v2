@@ -40,31 +40,37 @@ const clean = v => v.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 2
 // URL ?demo=1 でデモモード初期値を決定
 const urlDemo = new URLSearchParams(window.location.search).get('demo') === '1';
 
-// 朝4:00を日付の切り替え基準にする
+const APP_VERSION = '2.1.0';
+
+// 朝4:00を日付の切り替え基準にする（生活日: YYYY-MM-DD）
 const getBusinessDate = (date = new Date()) => {
   const shifted = new Date(date.getTime() - 4 * 60 * 60 * 1000);
   return new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Tokyo' }).format(shifted);
 };
 const today = () => getBusinessDate(new Date());
 
-// 本番モード時のみ、翌朝4:00まで振り返りをロック
+// 本番モード時：次の生活日の4:00を過ぎ、かつ作戦登録から6時間以上経過するまで振り返りをロック
 function isReviewLocked(record, demoMode) {
   if (!record || demoMode) return false;
-  // 同じ「作戦日」に登録されていたらロック
+  // 同じ生活日（今日）の場合はロック
   if (record.recordDate && record.recordDate === today()) return true;
+
   if (record.createdAt) {
     const createdMs = record.createdAt.seconds
       ? record.createdAt.seconds * 1000
       : new Date(record.createdAt).getTime();
     if (createdMs) {
-      // JST基準で翌朝4:00 = UTC翌日の -5h = UTC y-m-(d+1)T19:00Z (JST 4:00+9)
+      // 条件1: 作戦登録から6時間以上経過しているか
+      const sixHoursMs = 6 * 60 * 60 * 1000;
+      if (Date.now() - createdMs < sixHoursMs) return true;
+
+      // 条件2: 作戦登録生活日の翌朝4:00 (JST) を過ぎているか
       const jstDate = new Date(createdMs);
-      const shifted = new Date(jstDate.getTime() - 4 * 60 * 60 * 1000); // 4時間前にずらして「作戦日」を得る
+      const shifted = new Date(jstDate.getTime() - 4 * 60 * 60 * 1000); // 4時間前にずらして生活日を計算
       const y = shifted.getUTCFullYear();
       const m = shifted.getUTCMonth();
       const d = shifted.getUTCDate();
-      // 翌日の4:00 JST = 翌日の (4-9) = 前日の 19:00 UTC => d+1の -5h = Date.UTC(y,m,d+1,4,0,0) - 9h = Date.UTC(y,m,d+1,-5,0,0)
-      const unlockMs = Date.UTC(y, m, d + 1, 4 - 9, 0, 0); // JST 4:00 = UTC -5:00 = 前日UTC 19:00
+      const unlockMs = Date.UTC(y, m, d + 1, 4 - 9, 0, 0); // 翌朝4:00 JST (= UTC前日19:00)
       if (Date.now() < unlockMs) return true;
     }
   }
@@ -72,6 +78,7 @@ function isReviewLocked(record, demoMode) {
 }
 
 export default function App() {
+  const sessionStartedAt = useMemo(() => new Date().toISOString(), []);
   const [ready, setReady] = useState(false);
   const [uid, setUid] = useState('');
   const [code, setCode] = useState(localStorage.getItem(SK) || '');
@@ -107,7 +114,7 @@ export default function App() {
   function enter() { const c = clean(codeIn); if (c.length < 3) return msg('参加コードを確認してください。'); localStorage.setItem(SK, c); setCode(c) }
 
   async function onboard(v) {
-    const d = { ...v, ownerUid: uid, participantCode: code, appVersion: 5.4, customExcuses: v.excuses, savedFirstSteps: STEPS, createdAt: serverTimestamp(), updatedAt: serverTimestamp() };
+    const d = { ...v, ownerUid: uid, participantCode: code, appVersion: APP_VERSION, customExcuses: v.excuses, savedFirstSteps: STEPS, sessionStartedAt, createdAt: serverTimestamp(), updatedAt: serverTimestamp() };
     await setDoc(doc(db, 'participantsV4', uid), d);
     setProfile(d);
   }
@@ -117,13 +124,32 @@ export default function App() {
   const pendingLocked = isReviewLocked(pending, demoMode);
 
   async function savePlan(v) {
-    const id = demoMode ? `${today()}-${Date.now()}` : today();
+    const lifeDay = today();
+    const id = demoMode ? `${lifeDay}-${Date.now()}` : lifeDay;
     const ref = doc(db, 'participantsV4', uid, 'records', id);
     if (!demoMode) {
       const existing = await getDoc(ref);
       if (existing.exists()) { msg('今日の作戦は記録済みです。'); setFlow(null); return loadAll() }
     }
-    const d = { ownerUid: uid, participantCode: code, appVersion: 5.4, recordDate: today(), predictedExcuse: v.excuse, firstStepText: v.step, outcomeStatus: null, createdAt: serverTimestamp(), updatedAt: serverTimestamp() };
+    const excuseSource = EXCUSES.includes(v.excuse) ? 'preset' : 'custom';
+    const stepSource = STEPS.includes(v.step) ? 'preset' : 'custom';
+    const d = {
+      ownerUid: uid,
+      participantCode: code,
+      appVersion: APP_VERSION,
+      recordDate: lifeDay,
+      lifeDayStart: lifeDay,
+      predictedExcuse: v.excuse,
+      excuseSource,
+      firstStepText: v.step,
+      stepSource,
+      outcomeStatus: null,
+      sessionStartedAt,
+      planStartedAt: v.planStartedAt || null,
+      planCompletedAt: serverTimestamp(),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    };
     await setDoc(ref, d);
     const updates = {};
     if (v.newExcuse) updates.customExcuses = [...(profile.customExcuses || []), v.excuse].filter((x, i, a) => a.indexOf(x) === i).slice(-20);
@@ -143,7 +169,14 @@ export default function App() {
 
   async function saveReview(v) {
     const ref = doc(db, 'participantsV4', uid, 'records', pending.id);
-    await updateDoc(ref, { ...v, updatedAt: serverTimestamp(), reviewedAt: serverTimestamp() });
+    const reviewData = {
+      ...v,
+      sessionStartedAt,
+      reviewCompletedAt: serverTimestamp(),
+      reviewedAt: serverTimestamp(),
+      updatedAt: serverTimestamp()
+    };
+    await updateDoc(ref, reviewData);
     if (v.addActualToLibrary && v.actualExcuse) {
       const xs = [...(profile.customExcuses || []), v.actualExcuse].filter((x, i, a) => a.indexOf(x) === i).slice(-20);
       await updateDoc(doc(db, 'participantsV4', uid), { customExcuses: xs });
@@ -330,9 +363,11 @@ function Home({ pending, pendingLocked, current, records, review, plan }) {
   const stats = useMemo(() => {
     let moved = 0, match = 0, other = 0;
     records.forEach(r => {
-      if (r.outcomeStatus === 'acted') moved++;
-      else if (r.outcomeStatus === 'not_done' && r.predictionMatched === 'yes') match++;
-      else if (r.outcomeStatus === 'not_done' && r.predictionMatched === 'no') other++;
+      const isMoved = r.outcomeStatus === 'done' || r.outcomeStatus === 'partial' || r.outcomeStatus === 'acted';
+      const isNotDone = r.outcomeStatus === 'not_started' || r.outcomeStatus === 'not_done';
+      if (isMoved) moved++;
+      else if (isNotDone && r.predictionMatched === 'yes') match++;
+      else if (isNotDone && r.predictionMatched === 'no') other++;
     });
     return { moved, match, other, total: moved + match + other };
   }, [records]);
@@ -349,7 +384,7 @@ function Home({ pending, pendingLocked, current, records, review, plan }) {
             <p className="pair"><span>予測</span><b>{pending.predictedExcuse}</b></p>
             <p className="pair"><span>最初の一歩</span><b>{pending.firstStepText}</b></p>
             {pendingLocked
-              ? <p className="muted">振り返りは翌朝4:00からできます。</p>
+              ? <p className="muted">振り返りは翌朝4:00（かつ作戦登録から6時間経過後）からできます。</p>
               : <button className="primary" onClick={review}>振り返る</button>}
           </>
         ) : (
@@ -395,6 +430,7 @@ function Pattern({ stats }) {
 }
 
 function Plan({ profile, records, previous, save, back }) {
+  const [planStartedAt] = useState(() => new Date().toISOString());
   const [e, setE] = useState('');
   const [other, setOther] = useState('');
   const [step, setStep] = useState('');
@@ -460,7 +496,7 @@ function Plan({ profile, records, previous, save, back }) {
           </label>
         </Card>
       )}
-      <button className="primary" disabled={!excuse || !first || (repeated && !confirm)} onClick={() => save({ excuse, step: first, newExcuse: !!other.trim() })}>記録する</button>
+      <button className="primary" disabled={!excuse || !first || (repeated && !confirm)} onClick={() => save({ excuse, step: first, newExcuse: !!other.trim(), planStartedAt })}>記録する</button>
     </div>
   );
 }
@@ -487,12 +523,21 @@ function PublicExcuse({ draft, profile, publish }) {
 }
 
 function Review({ item, profile, save, back }) {
+  const [reviewStartedAt] = useState(() => new Date().toISOString());
   const [status, setStatus] = useState('');
   const [continued, setContinued] = useState(false);
   const [match, setMatch] = useState('');
   const [actual, setActual] = useState('');
   const [addActual, setAddActual] = useState(true);
+  const [selfBlame, setSelfBlame] = useState(null);
   const actualOptions = [...new Set([...(profile.customExcuses || []), ...EXCUSES])];
+
+  const canSave = status && (
+    status === 'done' ||
+    status === 'partial' ||
+    (status === 'not_started' && match && selfBlame !== null && (match !== 'no' || actual.trim()))
+  );
+
   return (
     <div className="stack">
       <button className="back" onClick={back}>← ホームへ</button>
@@ -504,12 +549,12 @@ function Review({ item, profile, save, back }) {
       <Card>
         <h2>できましたか？</h2>
         <div className="choices">
-          <button type="button" className={status === 'acted' ? 'choice on' : 'choice'} onClick={() => setStatus('acted')}>できた</button>
-          <button type="button" className={status === 'not_done' ? 'choice on' : 'choice'} onClick={() => setStatus('not_done')}>できなかった</button>
+          <button type="button" className={status === 'done' ? 'choice on' : 'choice'} onClick={() => setStatus('done')}>できた</button>
+          <button type="button" className={status === 'partial' ? 'choice on' : 'choice'} onClick={() => setStatus('partial')}>少しだけやった（一部できた）</button>
+          <button type="button" className={status === 'not_started' ? 'choice on' : 'choice'} onClick={() => setStatus('not_started')}>着手しなかった</button>
         </div>
-
       </Card>
-      {status === 'acted' && (
+      {status === 'done' && (
         <Card>
           <h2>どこまで進みましたか？</h2>
           <div className="choices">
@@ -518,38 +563,62 @@ function Review({ item, profile, save, back }) {
           </div>
         </Card>
       )}
-      {status === 'not_done' && (
-        <Card>
-          <h2>できなかった理由に「{item.predictedExcuse}」は当てはまりましたか？</h2>
-          <div className="choices">
-            <button type="button" className={match === 'yes' ? 'choice on' : 'choice'} onClick={() => setMatch('yes')}>当てはまった</button>
-            <button type="button" className={match === 'no' ? 'choice on' : 'choice'} onClick={() => setMatch('no')}>別の理由だった</button>
-            <button type="button" className={match === 'unknown' ? 'choice on' : 'choice'} onClick={() => setMatch('unknown')}>よく分からない</button>
-          </div>
-          {match === 'no' && (
-            <>
-              <h3>実際には、どの理由が近かったですか？</h3>
-              <div className="chips">
-                {actualOptions.map(x => <button key={x} type="button" className={actual === x ? 'chip on' : 'chip'} onClick={() => setActual(x)}>{x}</button>)}
-              </div>
-              <label>ほかの理由<input value={actual} onChange={e => setActual(e.target.value)} placeholder="例：時間がなかった" /></label>
-              <label className="check">
-                <input type="checkbox" checked={addActual} onChange={e => setAddActual(e.target.checked)} />
-                この理由を言い訳集にも追加する
-              </label>
-            </>
-          )}
-        </Card>
+      {status === 'not_started' && (
+        <>
+          <Card>
+            <h2>できなかった理由に「{item.predictedExcuse}」は当てはまりましたか？</h2>
+            <div className="choices">
+              <button type="button" className={match === 'yes' ? 'choice on' : 'choice'} onClick={() => setMatch('yes')}>当てはまった</button>
+              <button type="button" className={match === 'no' ? 'choice on' : 'choice'} onClick={() => setMatch('no')}>別の理由だった</button>
+              <button type="button" className={match === 'unknown' ? 'choice on' : 'choice'} onClick={() => setMatch('unknown')}>よく分からない</button>
+            </div>
+            {match === 'no' && (
+              <>
+                <h3>実際には、どの理由が近かったですか？</h3>
+                <div className="chips">
+                  {actualOptions.map(x => <button key={x} type="button" className={actual === x ? 'chip on' : 'chip'} onClick={() => setActual(x)}>{x}</button>)}
+                </div>
+                <label>ほかの理由<input value={actual} onChange={e => setActual(e.target.value)} placeholder="例：時間がなかった" /></label>
+                <label className="check">
+                  <input type="checkbox" checked={addActual} onChange={e => setAddActual(e.target.checked)} />
+                  この理由を言い訳集にも追加する
+                </label>
+              </>
+            )}
+          </Card>
+          <Card>
+            <h2>今回できなかったことで、自分を責める気持ちはありますか？</h2>
+            <p className="muted">1（全くない）〜 5（とてもある）でお答えください。</p>
+            <div className="scale-buttons">
+              {[1, 2, 3, 4, 5].map(num => (
+                <button
+                  key={num}
+                  type="button"
+                  className={selfBlame === num ? 'choice on' : 'choice'}
+                  onClick={() => setSelfBlame(num)}
+                >
+                  {num}
+                </button>
+              ))}
+            </div>
+            <div className="scale-labels">
+              <small>1: 全くない</small>
+              <small>5: とてもある</small>
+            </div>
+          </Card>
+        </>
       )}
       <button
         className="primary"
-        disabled={!status || (status === 'not_done' && !match) || (match === 'no' && !actual.trim())}
+        disabled={!canSave}
         onClick={() => save({
           outcomeStatus: status,
-          continuedBeyondFirstStep: status === 'acted' && continued,
-          predictionMatched: status === 'not_done' ? match : null,
-          actualExcuse: match === 'yes' ? item.predictedExcuse : match === 'no' ? actual.trim() : null,
-          addActualToLibrary: match === 'no' && addActual
+          continuedBeyondFirstStep: status === 'done' && continued,
+          predictionMatched: status === 'not_started' ? match : null,
+          actualExcuse: status === 'not_started' ? (match === 'yes' ? item.predictedExcuse : match === 'no' ? actual.trim() : null) : null,
+          addActualToLibrary: status === 'not_started' && match === 'no' && addActual,
+          selfBlameScore: status === 'not_started' ? selfBlame : null,
+          reviewStartedAt
         })}
       >保存する</button>
     </div>
@@ -579,7 +648,8 @@ function ReasonList({ records, profile }) {
     (profile.customExcuses || []).forEach(x => { if (x) map[x] = 0 });
     const add = x => { if (!x) return; map[x] = (map[x] || 0) + 1 };
     records.forEach(r => {
-      if (r.outcomeStatus !== 'not_done') return;
+      const isNotDone = r.outcomeStatus === 'not_started' || r.outcomeStatus === 'not_done';
+      if (!isNotDone) return;
       if (r.predictionMatched === 'yes') add(r.predictedExcuse);
       if (r.predictionMatched === 'no') add(r.actualExcuse);
     });
@@ -604,7 +674,8 @@ function StepList({ records }) {
       const x = map[r.firstStepText] || { name: r.firstStepText, setCount: 0, doneCount: 0, continuedCount: 0, last: 0, excuses: {} };
       x.setCount++;
       x.last = Math.max(x.last, r.createdAt?.seconds || records.length - i);
-      if (r.outcomeStatus === 'acted') {
+      const isDone = r.outcomeStatus === 'done' || r.outcomeStatus === 'partial' || r.outcomeStatus === 'acted';
+      if (isDone) {
         x.doneCount++;
         if (r.continuedBeyondFirstStep) x.continuedCount++;
         if (r.predictedExcuse) x.excuses[r.predictedExcuse] = (x.excuses[r.predictedExcuse] || 0) + 1;
