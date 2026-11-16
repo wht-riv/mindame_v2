@@ -706,7 +706,7 @@ function Loading() { return <div className="center"><div className="loader" /><p
 function Entry({ value, setValue, enter }) {
   return (
     <div className="entry">
-      <p className="eyebrow">言い訳と今日の対応</p>
+      <p className="eyebrow">言い訳と今日の一歩</p>
       <h1>みんだめ</h1>
       <label>参加番号<input value={value} onChange={e => setValue(e.target.value)} placeholder="例：MD-001" /></label>
       <button className="primary" onClick={enter}>はじめる</button>
@@ -834,7 +834,7 @@ function TripleCard({ intention, excuse, step }) {
       <p className="pair"><span>今日したいこと</span><b>{intention}</b></p>
       <p className="pair"><span>できなさそうな理由</span><b>{excuse}</b></p>
       <p className="pair"><span>最初に決めた方法</span><b>{step}</b></p>
-      <p className="plan-sentence">「{excuse}」という言い訳がある今日は、<br /><strong>{step}</strong></p>
+      <p className="plan-sentence">「{excuse}」時でも、<br /><strong>{step}</strong>ならできそうかも</p>
     </>
   );
 }
@@ -1007,7 +1007,7 @@ function Plan({ profile, records, save, saving, back }) {
       <ChipPick
         id="plan-method"
         title="その言い訳がある今日は、どうする？"
-        hint="少しだけ試す、別のやり方にする、今日は休んで後日に回すなど、今日の状況に合った対応を自分の言葉で書いてください。"
+        hint="少しだけ試す、別のやり方にする、今日は休んで後日に回すなど、今日の状況に合った一歩を自分の言葉で書いてください。"
         items={stepItems} state={step} setState={setStep}
         maxLength={LIMITS.step} placeholder="例：1つだけ片付ける／明日の朝に回す／今日は休む"
         example="入力例：ゴミを1つ捨てる／5分だけ試す／今日は休んで明日に回す"
@@ -1431,8 +1431,8 @@ function Community({ posts, uid, react, hidePost }) {
     <div className="stack">
       <div>
         <p className="eyebrow">みんなの記録</p>
-        <h1>みんなの言い訳と対応</h1>
-        <p className="muted">みんなが共有した言い訳と今日の対応です。</p>
+        <h1>みんなの言い訳と一歩目</h1>
+        <p className="muted">みんなが共有した言い訳と今日の一歩です。</p>
       </div>
       {posts.length === 0
         ? <Card><p className="muted">まだ共有された記録がありません。</p></Card>
@@ -1452,7 +1452,7 @@ function Post({ post, uid, react, hidePost }) {
         {post.ownerUid === uid && <small className="yours">あなたの記録</small>}
       </div>
       <div className="community-plan sentence">
-        <p>「{excuse}」という言い訳がある日：<br /><strong>{post.firstStepText || '対応は未登録'}</strong></p>
+        <p>「{excuse}」時でも、<br /><strong>{post.firstStepText || '一歩は未登録'}</strong>ならできそうかも</p>
       </div>
       <div className="reacts">
         {REACTIONS.map(r => (
