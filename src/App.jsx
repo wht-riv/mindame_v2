@@ -152,56 +152,10 @@ const normalizeActionResult = rOrStatus => {
 // 旧コード互換エイリアス
 const normalizeOutcome = normalizeActionResult;
 
-const isStartedResult = rOrStatus => {
-  const res = normalizeActionResult(rOrStatus);
-  return res === 'planned_method' || res === 'alternative_method';
-};
-
 const getActionResultLabel = rOrStatus => {
   const res = normalizeActionResult(rOrStatus);
   return res ? ACTION_RESULT_SHORT_LABELS[res] : '振り返りなし';
 };
-
-// 集計処理：1. 3分類（当初方法による着手・未着手・代替方法による着手）、2. 着手の有無（着手あり・着手なし）
-function summarizeRecords(records) {
-  let plannedMethod = 0;
-  let alternativeMethod = 0;
-  let notStarted = 0;
-  let matchedExcuse = 0;
-  let otherExcuse = 0;
-  (records || []).forEach(r => {
-    const res = normalizeActionResult(r);
-    if (res === 'planned_method') {
-      plannedMethod++;
-    } else if (res === 'alternative_method') {
-      alternativeMethod++;
-    } else if (res === 'not_started') {
-      notStarted++;
-      if (r.predictionMatched === 'yes') matchedExcuse++;
-      else if (r.predictionMatched === 'no') otherExcuse++;
-    }
-  });
-  const started = plannedMethod + alternativeMethod;
-  const total = started + notStarted;
-  return {
-    byCategory: {
-      planned_method: plannedMethod,
-      not_started: notStarted,
-      alternative_method: alternativeMethod
-    },
-    byStarted: {
-      started,
-      not_started: notStarted
-    },
-    plannedMethod,
-    alternativeMethod,
-    notStarted,
-    started,
-    matchedExcuse,
-    otherExcuse,
-    total
-  };
-}
 const intentionOf = r => (r && (r.dailyIntentionText || r.goalText)) || '登録された行動';
 const normalizeReactionType = t => (t === 'seed' ? 'dekisou' : t);
 
@@ -676,7 +630,7 @@ export default function App() {
   return (
     <Shell demoMode={demoMode} toggleDemo={toggleDemo} profile={profile} toast={toast}>
       <div className="page">
-        {tab === 'home' && <Home pending={pending} latestReviewed={latestReviewed} pendingLocked={pendingLocked} current={current} planBlocked={planBlocked} records={records} review={openReview} plan={openPlan} />}
+        {tab === 'home' && <Home pending={pending} latestReviewed={latestReviewed} pendingLocked={pendingLocked} current={current} planBlocked={planBlocked} review={openReview} plan={openPlan} />}
         {tab === 'excuses' && <MyRecords records={records} profile={profile} editReview={openReview} />}
         {tab === 'community' && <Community posts={posts} uid={uid} react={react} hidePost={hidePost} />}
       </div>
@@ -706,7 +660,7 @@ function Loading() { return <div className="center"><div className="loader" /><p
 function Entry({ value, setValue, enter }) {
   return (
     <div className="entry">
-      <p className="eyebrow">言い訳と今日の一歩</p>
+      <p className="eyebrow">今日の言い訳と一歩</p>
       <h1>みんだめ</h1>
       <label>参加番号<input value={value} onChange={e => setValue(e.target.value)} placeholder="例：MD-001" /></label>
       <button className="primary" onClick={enter}>はじめる</button>
@@ -839,8 +793,7 @@ function TripleCard({ intention, excuse, step }) {
   );
 }
 
-function Home({ pending, latestReviewed, pendingLocked, current, planBlocked, records, review, plan }) {
-  const stats = useMemo(() => summarizeRecords(records), [records]);
+function Home({ pending, latestReviewed, pendingLocked, current, planBlocked, review, plan }) {
   const latestRes = latestReviewed ? normalizeActionResult(latestReviewed) : null;
   return (
     <div className="stack">
@@ -886,31 +839,7 @@ function Home({ pending, latestReviewed, pendingLocked, current, planBlocked, re
         )}
         <button className="primary" disabled={planBlocked} onClick={plan}>{planBlocked ? '今日の作戦は登録済みです' : '今日の作戦を考える'}</button>
       </Card>
-      <Pattern stats={stats} />
     </div>
-  );
-}
-
-function Pattern({ stats }) {
-  if (!stats.total) return <Card><h2>最近の振り返り内訳</h2><p className="muted">振り返りが増えると、ここに内訳が表示されます。</p></Card>;
-  return (
-    <Card>
-      <h2>最近の振り返り内訳</h2>
-      <div className="bar">
-        <i className="moved" style={{ width: `${stats.plannedMethod / stats.total * 100}%` }} />
-        <i className="alt" style={{ width: `${stats.alternativeMethod / stats.total * 100}%` }} />
-        <i className="other" style={{ width: `${stats.notStarted / stats.total * 100}%` }} />
-      </div>
-      <div className="legend">
-        <span><i className="dot moved" />最初に決めた方法で着手 <b>{stats.plannedMethod}</b></span>
-        <span><i className="dot alt" />ほかの方法で着手 <b>{stats.alternativeMethod}</b></span>
-        <span><i className="dot other" />未着手 <b>{stats.notStarted}</b></span>
-      </div>
-      <div className="step-stats two">
-        <span>着手あり <b>{stats.started}</b></span>
-        <span>未着手 <b>{stats.notStarted}</b></span>
-      </div>
-    </Card>
   );
 }
 
@@ -1432,7 +1361,7 @@ function Community({ posts, uid, react, hidePost }) {
       <div>
         <p className="eyebrow">みんなの記録</p>
         <h1>みんなの言い訳と一歩目</h1>
-        <p className="muted">みんなが共有した言い訳と今日の一歩です。</p>
+        <p className="muted">みんなが共有した今日の言い訳と一歩です。</p>
       </div>
       {posts.length === 0
         ? <Card><p className="muted">まだ共有された記録がありません。</p></Card>
