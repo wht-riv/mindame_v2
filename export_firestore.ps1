@@ -187,13 +187,75 @@ function Format-JstDate($val) {
     }
 }
 
+function Normalize-Outcome($s) {
+    if ($s -eq 'done' -or $s -eq 'acted') { return 'done' }
+    if ($s -eq 'partial') { return 'partial' }
+    if ($s -eq 'not_started' -or $s -eq 'not_done') { return 'not_started' }
+    return ''
+}
+
+function Get-JstDateTime($val) {
+    if ([string]::IsNullOrWhiteSpace($val)) { return $null }
+    try {
+        return [DateTimeOffset]::Parse($val).ToOffset([TimeSpan]::FromHours(9)).DateTime
+    } catch {
+        return $null
+    }
+}
+
+# 4:00境界の生活日 (JST) YYYY-MM-DD
+function Get-LifeDate($dt) {
+    if ($null -eq $dt) { return "" }
+    $shifted = $dt.AddHours(-4)
+    return $shifted.ToString("yyyy-MM-dd")
+}
+
+function Get-NextDay($ymd) {
+    if ([string]::IsNullOrWhiteSpace($ymd)) { return "" }
+    try {
+        $parts = $ymd.Trim().Split('-')
+        $d = [DateTime]::new([int]$parts[0], [int]$parts[1], [int]$parts[2])
+        return $d.AddDays(1).ToString("yyyy-MM-dd")
+    } catch {
+        return ""
+    }
+}
+
+# 再利用成功: not_started の翌生活日に、振り返りを完了し、新しい作戦を登録した
+function Test-ReusedNextLifeDay($rec, $allRecs) {
+    $outcomeNorm = Normalize-Outcome $rec.outcomeStatus
+    if ($outcomeNorm -ne 'not_started' -or [string]::IsNullOrWhiteSpace($rec.recordDate)) {
+        return ""
+    }
+    $reviewedStr = if (-not [string]::IsNullOrWhiteSpace($rec.reviewCompletedAt)) { $rec.reviewCompletedAt } else { $rec.reviewedAt }
+    $reviewedDt = Get-JstDateTime $reviewedStr
+    if ($null -eq $reviewedDt) { return "" }
+
+    $next = Get-NextDay $rec.recordDate
+    if ([string]::IsNullOrWhiteSpace($next)) { return "" }
+
+    $reviewedLifeDate = Get-LifeDate $reviewedDt
+    if ($reviewedLifeDate -ne $next) {
+        return "FALSE"
+    }
+
+    $planned = $false
+    foreach ($r in $allRecs) {
+        if ($r.recordDate -eq $next -and (-not [string]::IsNullOrWhiteSpace($r.planCompletedAt) -or -not [string]::IsNullOrWhiteSpace($r.createdAt))) {
+            $planned = $true
+            break
+        }
+    }
+    if ($planned) { return "TRUE" } else { return "FALSE" }
+}
+
 function Escape-CsvVal($val) {
-    if ($null -eq $val) { return '""' }
+    if ($null -eq $val) { return '' }
     $s = [string]$val
     if ($s.Contains(',') -or $s.Contains('"') -or $s.Contains("`n") -or $s.Contains("`r")) {
         return '"' + $s.Replace('"', '""') + '"'
     }
-    return '"' + $s + '"'
+    return $s
 }
 
 $sa = Get-Content serviceAccountKey.json -Raw | ConvertFrom-Json
@@ -219,14 +281,20 @@ $recordHeaders = @(
     'participantCode',
     'uid',
     'appVersion',
+    'recordDate',
     'lifeDayStart',
+    'dailyIntentionText',
+    'dailyIntentionSource',
+    'goalText',
     'predictedExcuse',
     'excuseSource',
     'firstStepText',
     'stepSource',
     'outcomeStatus',
+    'outcomeNormalized',
     'predictionMatched',
     'actualExcuse',
+    'actualExcuseSource',
     'selfBlameScore',
     'createdAt',
     'reviewedAt',
@@ -234,7 +302,10 @@ $recordHeaders = @(
     'planStartedAt',
     'planCompletedAt',
     'reviewStartedAt',
-    'reviewCompletedAt'
+    'reviewCompletedAt',
+    'sessionDurationSeconds',
+    'reviewAvailableAt',
+    'reusedNextLifeDay'
 )
 
 $recordRows = @()
@@ -246,6 +317,7 @@ foreach ($pDoc in $partDocs) {
     $pVer = Get-FsField $pFields 'appVersion'
 
     # Fetch records subcollection
+    $pRecordList = @()
     $recPageToken = ""
     do {
         $recUrl = "https://firestore.googleapis.com/v1/$($pDoc.name)/records?pageSize=100"
@@ -255,28 +327,81 @@ foreach ($pDoc in $partDocs) {
             if ($recResp.documents) {
                 foreach ($rDoc in $recResp.documents) {
                     $rFields = $rDoc.fields
-                    $row = [ordered]@{
-                        participantCode = $(if ($v = Get-FsField $rFields 'participantCode') { $v } else { $pCode })
-                        uid = $(if ($v = Get-FsField $rFields 'ownerUid') { $v } else { $uid })
-                        appVersion = $(if ($v = Get-FsField $rFields 'appVersion') { $v } else { $pVer })
-                        lifeDayStart = $(if ($v = Get-FsField $rFields 'lifeDayStart') { $v } elseif ($v = Get-FsField $rFields 'recordDate') { $v } else { "" })
-                        predictedExcuse = Get-FsField $rFields 'predictedExcuse'
-                        excuseSource = Get-FsField $rFields 'excuseSource'
-                        firstStepText = Get-FsField $rFields 'firstStepText'
-                        stepSource = Get-FsField $rFields 'stepSource'
-                        outcomeStatus = Get-FsField $rFields 'outcomeStatus'
-                        predictionMatched = Get-FsField $rFields 'predictionMatched'
-                        actualExcuse = Get-FsField $rFields 'actualExcuse'
-                        selfBlameScore = Get-FsField $rFields 'selfBlameScore'
-                        createdAt = Get-FsField $rFields 'createdAt'
-                        reviewedAt = Get-FsField $rFields 'reviewedAt'
-                        sessionStartedAt = Format-JstDate (Get-FsField $rFields 'sessionStartedAt')
-                        planStartedAt = Format-JstDate (Get-FsField $rFields 'planStartedAt')
-                        planCompletedAt = Get-FsField $rFields 'planCompletedAt'
-                        reviewStartedAt = Format-JstDate (Get-FsField $rFields 'reviewStartedAt')
-                        reviewCompletedAt = Get-FsField $rFields 'reviewCompletedAt'
+
+                    $participantCode = Get-FsField $rFields 'participantCode'
+                    if (-not $participantCode) { $participantCode = $pCode }
+
+                    $uidVal = Get-FsField $rFields 'ownerUid'
+                    if (-not $uidVal) { $uidVal = $uid }
+
+                    $appVer = Get-FsField $rFields 'appVersion'
+                    if (-not $appVer) { $appVer = $pVer }
+
+                    $recordDate = Get-FsField $rFields 'recordDate'
+
+                    $lifeDayStart = Format-JstDate (Get-FsField $rFields 'lifeDayStart')
+                    if (-not $lifeDayStart) { $lifeDayStart = $recordDate }
+
+                    $dailyIntentionText = Get-FsField $rFields 'dailyIntentionText'
+                    if (-not $dailyIntentionText) { $dailyIntentionText = Get-FsField $rFields 'goalText' }
+
+                    $dailyIntentionSource = Get-FsField $rFields 'dailyIntentionSource'
+                    if (-not $dailyIntentionSource) { $dailyIntentionSource = Get-FsField $rFields 'intentionSource' }
+
+                    $goalText = Get-FsField $rFields 'goalText'
+                    $predictedExcuse = Get-FsField $rFields 'predictedExcuse'
+                    $excuseSource = Get-FsField $rFields 'excuseSource'
+                    $firstStepText = Get-FsField $rFields 'firstStepText'
+                    $stepSource = Get-FsField $rFields 'stepSource'
+                    $outcomeStatus = Get-FsField $rFields 'outcomeStatus'
+                    $outcomeNormalized = Normalize-Outcome $outcomeStatus
+                    $predictionMatched = Get-FsField $rFields 'predictionMatched'
+                    $actualExcuse = Get-FsField $rFields 'actualExcuse'
+                    $actualExcuseSource = Get-FsField $rFields 'actualExcuseSource'
+
+                    $selfBlameScore = Get-FsField $rFields 'selfBlameAfterNotStarted'
+                    if ($selfBlameScore -eq "") { $selfBlameScore = Get-FsField $rFields 'selfBlameScore' }
+
+                    $createdAt = Format-JstDate (Get-FsField $rFields 'createdAt')
+                    $reviewedAt = Format-JstDate (Get-FsField $rFields 'reviewedAt')
+                    $sessionStartedAt = Format-JstDate (Get-FsField $rFields 'sessionStartedAt')
+                    $planStartedAt = Format-JstDate (Get-FsField $rFields 'planStartedAt')
+                    $planCompletedAt = Format-JstDate (Get-FsField $rFields 'planCompletedAt')
+                    $reviewStartedAt = Format-JstDate (Get-FsField $rFields 'reviewStartedAt')
+                    $reviewCompletedAt = Format-JstDate (Get-FsField $rFields 'reviewCompletedAt')
+                    $sessionDurationSeconds = Get-FsField $rFields 'sessionDurationSeconds'
+                    $reviewAvailableAt = Format-JstDate (Get-FsField $rFields 'reviewAvailableAt')
+
+                    $pRecordList += [PSCustomObject][ordered]@{
+                        participantCode = $participantCode
+                        uid = $uidVal
+                        appVersion = $appVer
+                        recordDate = $recordDate
+                        lifeDayStart = $lifeDayStart
+                        dailyIntentionText = $dailyIntentionText
+                        dailyIntentionSource = $dailyIntentionSource
+                        goalText = $goalText
+                        predictedExcuse = $predictedExcuse
+                        excuseSource = $excuseSource
+                        firstStepText = $firstStepText
+                        stepSource = $stepSource
+                        outcomeStatus = $outcomeStatus
+                        outcomeNormalized = $outcomeNormalized
+                        predictionMatched = $predictionMatched
+                        actualExcuse = $actualExcuse
+                        actualExcuseSource = $actualExcuseSource
+                        selfBlameScore = $selfBlameScore
+                        createdAt = $createdAt
+                        reviewedAt = $reviewedAt
+                        sessionStartedAt = $sessionStartedAt
+                        planStartedAt = $planStartedAt
+                        planCompletedAt = $planCompletedAt
+                        reviewStartedAt = $reviewStartedAt
+                        reviewCompletedAt = $reviewCompletedAt
+                        sessionDurationSeconds = $sessionDurationSeconds
+                        reviewAvailableAt = $reviewAvailableAt
+                        reusedNextLifeDay = ""
                     }
-                    $recordRows += [PSCustomObject]$row
                 }
             }
             $recPageToken = $recResp.nextPageToken
@@ -285,6 +410,11 @@ foreach ($pDoc in $partDocs) {
             $recPageToken = ""
         }
     } while ($recPageToken)
+
+    foreach ($r in $pRecordList) {
+        $r.reusedNextLifeDay = Test-ReusedNextLifeDay $r $pRecordList
+        $recordRows += $r
+    }
 }
 
 # Sort by createdAt descending
@@ -320,6 +450,7 @@ Write-Host "Found $($postDocs.Count) public posts."
 $postHeaders = @(
     'postId',
     'ownerUid',
+    'dailyIntentionText',
     'goalText',
     'excuseText',
     'firstStepText',
@@ -351,15 +482,25 @@ foreach ($pDoc in $postDocs) {
         }
     } while ($reactPageToken)
 
+    $dailyIntentionText = Get-FsField $pFields 'dailyIntentionText'
+    if (-not $dailyIntentionText) { $dailyIntentionText = Get-FsField $pFields 'goalText' }
+    $goalText = Get-FsField $pFields 'goalText'
+    $excuseText = Get-FsField $pFields 'excuseText'
+    $firstStepText = Get-FsField $pFields 'firstStepText'
+    $isVisibleVal = Get-FsField $pFields 'isVisible'
+    $isVisible = if ($isVisibleVal -ne "") { $isVisibleVal.ToLower() } else { "true" }
+    $createdAt = Format-JstDate (Get-FsField $pFields 'createdAt')
+
     if ($reactDocs.Count -eq 0) {
         $postRows += [PSCustomObject][ordered]@{
             postId = $postId
             ownerUid = Get-FsField $pFields 'ownerUid'
-            goalText = Get-FsField $pFields 'goalText'
-            excuseText = Get-FsField $pFields 'excuseText'
-            firstStepText = Get-FsField $pFields 'firstStepText'
-            isVisible = Get-FsField $pFields 'isVisible'
-            createdAt = Get-FsField $pFields 'createdAt'
+            dailyIntentionText = $dailyIntentionText
+            goalText = $goalText
+            excuseText = $excuseText
+            firstStepText = $firstStepText
+            isVisible = $isVisible
+            createdAt = $createdAt
             reactionUid = ''
             reactionType = ''
             reactionUpdatedAt = ''
@@ -368,16 +509,17 @@ foreach ($pDoc in $postDocs) {
         foreach ($rDoc in $reactDocs) {
             $rId = $rDoc.name.Split('/')[-1]
             $rFields = $rDoc.fields
-            $updatedAt = Get-FsField $rFields 'updatedAt'
-            if (-not $updatedAt) { $updatedAt = Get-FsField $rFields 'createdAt' }
+            $updatedAt = Format-JstDate (Get-FsField $rFields 'updatedAt')
+            if (-not $updatedAt) { $updatedAt = Format-JstDate (Get-FsField $rFields 'createdAt') }
             $postRows += [PSCustomObject][ordered]@{
                 postId = $postId
                 ownerUid = Get-FsField $pFields 'ownerUid'
-                goalText = Get-FsField $pFields 'goalText'
-                excuseText = Get-FsField $pFields 'excuseText'
-                firstStepText = Get-FsField $pFields 'firstStepText'
-                isVisible = Get-FsField $pFields 'isVisible'
-                createdAt = Get-FsField $pFields 'createdAt'
+                dailyIntentionText = $dailyIntentionText
+                goalText = $goalText
+                excuseText = $excuseText
+                firstStepText = $firstStepText
+                isVisible = $isVisible
+                createdAt = $createdAt
                 reactionUid = $rId
                 reactionType = Get-FsField $rFields 'type'
                 reactionUpdatedAt = $updatedAt
