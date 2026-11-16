@@ -75,7 +75,7 @@ const REACTIONS = [
   { id: 'dekisou', label: 'できそう', icon: '👣' }
 ];
 
-const LIMITS = { intention: 80, excuse: 60, step: 80 };
+const LIMITS = { intention: 80, excuse: 60, step: 80, alternative: 80 };
 const SK = 'mindameParticipantCodeV53';
 const clean = v => v.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 20);
 const uniq = xs => xs.filter((x, i, a) => x && a.indexOf(x) === i);
@@ -117,13 +117,84 @@ function isReviewLocked(record, demoMode) {
   const ms = getReviewAvailableMs(record);
   return ms ? Date.now() < ms : false;
 }
-// ---- 旧データ互換 ----
-const normalizeOutcome = s => {
-  if (s === 'done' || s === 'acted') return 'done';
-  if (s === 'partial') return 'partial';
-  if (s === 'not_started' || s === 'not_done') return 'not_started';
-  return null; // changed / unknown / null は主要集計対象外
+// ---- 結果定義・旧データ互換・集計 ----
+const ACTION_RESULTS = [
+  { value: 'planned_method', label: '最初に決めた方法で、取りかかることができた' },
+  { value: 'not_started', label: '取りかかることができなかった' },
+  { value: 'alternative_method', label: 'ほかの方法で、取りかかることができた' }
+];
+const VALID_ACTION_RESULTS = ACTION_RESULTS.map(x => x.value);
+
+const ACTION_RESULT_SHORT_LABELS = {
+  planned_method: '最初に決めた方法で着手',
+  not_started: '未着手',
+  alternative_method: 'ほかの方法で着手'
 };
+
+// 新形式（actionResult）と旧形式（outcomeStatus: done/acted/partial/changed/not_started/not_done）の両方を安全に正規化する
+const normalizeActionResult = rOrStatus => {
+  const raw = rOrStatus && typeof rOrStatus === 'object'
+    ? (rOrStatus.actionResult || rOrStatus.outcomeStatus)
+    : rOrStatus;
+  if (raw === 'planned_method' || raw === 'done' || raw === 'acted' || raw === 'partial') return 'planned_method';
+  if (raw === 'alternative_method' || raw === 'changed') return 'alternative_method';
+  if (raw === 'not_started' || raw === 'not_done') return 'not_started';
+  return null; // unknown / null は未回答または主要集計対象外
+};
+
+// 旧コード互換エイリアス
+const normalizeOutcome = normalizeActionResult;
+
+const isStartedResult = rOrStatus => {
+  const res = normalizeActionResult(rOrStatus);
+  return res === 'planned_method' || res === 'alternative_method';
+};
+
+const getActionResultLabel = rOrStatus => {
+  const res = normalizeActionResult(rOrStatus);
+  return res ? ACTION_RESULT_SHORT_LABELS[res] : '振り返り前';
+};
+
+// 集計処理：1. 3分類（当初方法による着手・未着手・代替方法による着手）、2. 着手の有無（着手あり・着手なし）
+function summarizeRecords(records) {
+  let plannedMethod = 0;
+  let alternativeMethod = 0;
+  let notStarted = 0;
+  let matchedExcuse = 0;
+  let otherExcuse = 0;
+  (records || []).forEach(r => {
+    const res = normalizeActionResult(r);
+    if (res === 'planned_method') {
+      plannedMethod++;
+    } else if (res === 'alternative_method') {
+      alternativeMethod++;
+    } else if (res === 'not_started') {
+      notStarted++;
+      if (r.predictionMatched === 'yes') matchedExcuse++;
+      else if (r.predictionMatched === 'no') otherExcuse++;
+    }
+  });
+  const started = plannedMethod + alternativeMethod;
+  const total = started + notStarted;
+  return {
+    byCategory: {
+      planned_method: plannedMethod,
+      not_started: notStarted,
+      alternative_method: alternativeMethod
+    },
+    byStarted: {
+      started,
+      not_started: notStarted
+    },
+    plannedMethod,
+    alternativeMethod,
+    notStarted,
+    started,
+    matchedExcuse,
+    otherExcuse,
+    total
+  };
+}
 const intentionOf = r => (r && (r.dailyIntentionText || r.goalText)) || '登録された行動';
 const normalizeReactionType = t => (t === 'seed' ? 'dekisou' : t);
 
@@ -131,6 +202,7 @@ export default function App() {
   const sessionStart = useRef(new Date());
   const reviewOpenedAt = useRef(null);
   const reviewStartSaved = useRef(false);
+  const savingRef = useRef(false);
   const [ready, setReady] = useState(false);
   const [authFailed, setAuthFailed] = useState(false);
   const [uid, setUid] = useState('');
@@ -143,6 +215,7 @@ export default function App() {
   const [posts, setPosts] = useState([]);
   const [tab, setTab] = useState('home');
   const [flow, setFlow] = useState(null);
+  const [reviewTarget, setReviewTarget] = useState(null);
   const [shareDraft, setShareDraft] = useState(null);
   const [toast, setToast] = useState('');
   const [demoMode, setDemoMode] = useState(urlDemo);
@@ -265,7 +338,8 @@ export default function App() {
     }
   }
 
-  const pending = records.find(r => !r.outcomeStatus) || null;
+  const pending = records.find(r => !normalizeActionResult(r)) || null;
+  const latestReviewed = records.find(r => !!normalizeActionResult(r)) || null;
   const todayRecord = records.find(r => r.recordDate === today()) || null;
   const current = demoMode ? pending : todayRecord;
   const pendingLocked = isReviewLocked(pending, demoMode);
@@ -278,9 +352,10 @@ export default function App() {
   }
 
   async function savePlan(v) {
-    if (saving) return;
+    if (saving || savingRef.current) return;
     const intention = (v.intention || '').trim(), excuse = (v.excuse || '').trim(), step = (v.step || '').trim();
     if (!intention || intention.length > LIMITS.intention || !excuse || excuse.length > LIMITS.excuse || !step || step.length > LIMITS.step) return;
+    savingRef.current = true;
     setSaving(true);
     try {
       const now = new Date();
@@ -311,6 +386,8 @@ export default function App() {
         excuseSource,
         firstStepText: step,
         stepSource,
+        actionResult: null,
+        alternativeActionText: null,
         outcomeStatus: null,
         predictionMatched: null,
         actualExcuse: null,
@@ -348,6 +425,7 @@ export default function App() {
       logError('write', 'savePlan', e);
       msg('記録できませんでした。');
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }
@@ -381,15 +459,19 @@ export default function App() {
     setShareDraft(null); setFlow(null); setTab('home');
   }
 
-  async function openReview() {
-    if (!pending || pendingLocked) return;
+  async function openReview(targetRecord = null) {
+    const target = targetRecord && targetRecord.id ? targetRecord : pending;
+    if (!target) return;
+    const isUnreviewed = !normalizeActionResult(target);
+    if (isUnreviewed && isReviewLocked(target, demoMode)) return;
+    setReviewTarget(target);
     setFlow('review');
     reviewOpenedAt.current = new Date();
-    reviewStartSaved.current = !!pending.reviewStartedAt;
-    logEvent('review_opened', { recordId: pending.id });
-    if (!pending.reviewStartedAt) {
+    reviewStartSaved.current = !!target.reviewStartedAt;
+    logEvent('review_opened', { recordId: target.id });
+    if (!target.reviewStartedAt) {
       try {
-        await updateDoc(doc(db, 'participantsV4', uid, 'records', pending.id), { reviewStartedAt: serverTimestamp(), updatedAt: serverTimestamp() });
+        await updateDoc(doc(db, 'participantsV4', uid, 'records', target.id), { reviewStartedAt: serverTimestamp(), updatedAt: serverTimestamp() });
         reviewStartSaved.current = true;
       } catch (e) {
         logError('write', 'reviewStart', e);
@@ -398,36 +480,51 @@ export default function App() {
   }
 
   async function saveReview(v) {
-    if (saving || !pending) return;
-    if (v.outcomeStatus !== 'done' && v.outcomeStatus !== 'not_started') return;
-    const outcome = v.outcomeStatus;
+    const target = reviewTarget || pending;
+    if (saving || savingRef.current || !target) return;
+    const actionResult = v.actionResult || v.outcomeStatus;
+    if (!VALID_ACTION_RESULTS.includes(actionResult)) return;
+    const altText = actionResult === 'alternative_method' ? (v.alternativeActionText || '').trim() : '';
+    if (actionResult === 'alternative_method' && (!altText || altText.length > LIMITS.alternative)) return;
+    if (actionResult === 'not_started') {
+      if (!['yes', 'no', 'unknown'].includes(v.predictionMatched)) return;
+      if (v.predictionMatched === 'no' && !(v.actualExcuse || '').trim()) return;
+    }
+    savingRef.current = true;
     setSaving(true);
     try {
       const saved = cleanList([...listOf(profile.preferredExcuses), ...listOf(profile.customExcuses)]);
-      const actual = outcome === 'not_started' && v.predictionMatched === 'no' ? (v.actualExcuse || '').trim() : null;
+      const actual = actionResult === 'not_started' && v.predictionMatched === 'no' ? (v.actualExcuse || '').trim() : null;
       const actualExcuseSource = actual ? (saved.includes(actual) ? 'saved' : EXCUSES.includes(actual) ? 'preset' : 'custom') : null;
       const data = {
-        outcomeStatus: outcome,
-        predictionMatched: outcome === 'not_started' ? (v.predictionMatched || null) : null,
+        actionResult,
+        outcomeStatus: actionResult,
+        alternativeActionText: actionResult === 'alternative_method' ? altText : null,
+        predictionMatched: actionResult === 'not_started' ? (v.predictionMatched || null) : null,
         actualExcuse: actual || null,
-        actualExcuseSource,
+        actualExcuseSource: actionResult === 'not_started' ? actualExcuseSource : null,
         reviewCompletedAt: serverTimestamp(),
         reviewedAt: serverTimestamp(),
         updatedAt: serverTimestamp()
       };
       if (!reviewStartSaved.current && reviewOpenedAt.current) data.reviewStartedAt = Timestamp.fromDate(reviewOpenedAt.current);
-      await updateDoc(doc(db, 'participantsV4', uid, 'records', pending.id), data);
-      if (v.addActualToLibrary && actual) {
+      await updateDoc(doc(db, 'participantsV4', uid, 'records', target.id), data);
+      if (actionResult === 'not_started' && v.addActualToLibrary && actual) {
         const xs = cleanList([actual, ...listOf(profile.customExcuses)]).slice(0, 20);
         await updateDoc(doc(db, 'participantsV4', uid), { customExcuses: xs, updatedAt: serverTimestamp() });
         setProfile(p => ({ ...p, customExcuses: xs }));
       }
-      logEvent('review_completed', { recordId: pending.id });
-      await loadAll(); setFlow(null); setTab('home'); msg('振り返りを記録しました。');
+      logEvent('review_completed', { recordId: target.id });
+      await loadAll();
+      setReviewTarget(null);
+      setFlow(null);
+      setTab('home');
+      msg('振り返りを記録しました。');
     } catch (e) {
       logError('write', 'saveReview', e);
       msg('記録できませんでした。');
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   }
@@ -513,14 +610,17 @@ export default function App() {
   if (loading) return shell(<Loading />);
   if (!profile) return shell(<Onboard submit={onboard} />);
   if (needsPrefs(profile)) return shell(<PreferenceSetup profile={profile} submit={savePrefs} />);
+  const activeReviewItem = reviewTarget
+    ? (records.find(r => r.id === reviewTarget.id) || reviewTarget)
+    : (pending && !pendingLocked ? pending : null);
   if (flow === 'plan') return shell(<Plan profile={profile} records={records} save={savePlan} saving={saving} back={() => setFlow(null)} />);
   if (flow === 'publish' && shareDraft) return shell(<PublicExcuse draft={shareDraft} publish={publishExcuse} />);
-  if (flow === 'review' && pending && !pendingLocked) return shell(<Review item={pending} profile={profile} save={saveReview} saving={saving} back={() => setFlow(null)} />);
+  if (flow === 'review' && activeReviewItem) return shell(<Review item={activeReviewItem} profile={profile} save={saveReview} saving={saving} back={() => { setReviewTarget(null); setFlow(null); }} />);
   return (
     <Shell demoMode={demoMode} toggleDemo={toggleDemo} profile={profile} toast={toast}>
       <div className="page">
-        {tab === 'home' && <Home pending={pending} pendingLocked={pendingLocked} current={current} planBlocked={planBlocked} records={records} review={openReview} plan={openPlan} />}
-        {tab === 'excuses' && <MyRecords records={records} profile={profile} />}
+        {tab === 'home' && <Home pending={pending} latestReviewed={latestReviewed} pendingLocked={pendingLocked} current={current} planBlocked={planBlocked} records={records} review={openReview} plan={openPlan} />}
+        {tab === 'excuses' && <MyRecords records={records} profile={profile} editReview={openReview} />}
         {tab === 'community' && <Community posts={posts} uid={uid} react={react} hidePost={hidePost} />}
       </div>
       <Nav tab={tab} setTab={setTab} />
@@ -549,7 +649,7 @@ function Loading() { return <div className="center"><div className="loader" /><p
 function Entry({ value, setValue, enter }) {
   return (
     <div className="entry">
-      <p className="eyebrow">言い訳と最初の一歩</p>
+      <p className="eyebrow">言い訳と今日の対応</p>
       <h1>みんだめ</h1>
       <label>参加番号<input value={value} onChange={e => setValue(e.target.value)} placeholder="例：MD-001" /></label>
       <button className="primary" onClick={enter}>はじめる</button>
@@ -674,25 +774,17 @@ function PreferenceSetup({ profile, submit }) {
 function TripleCard({ intention, excuse, step }) {
   return (
     <>
-      <p className="pair"><span>少し整えたいこと</span><b>{intention}</b></p>
+      <p className="pair"><span>今日したいこと</span><b>{intention}</b></p>
       <p className="pair"><span>できなさそうな理由</span><b>{excuse}</b></p>
-      <p className="pair"><span>それでもできそうな一歩</span><b>{step}</b></p>
-      <p className="plan-sentence">「{excuse}」と思う日でも、<br /><strong>{step}</strong>ならできるかも。</p>
+      <p className="pair"><span>最初に決めた方法</span><b>{step}</b></p>
+      <p className="plan-sentence">「{excuse}」という言い訳がある今日は、<br /><strong>{step}</strong></p>
     </>
   );
 }
 
-function Home({ pending, pendingLocked, current, planBlocked, records, review, plan }) {
-  const stats = useMemo(() => {
-    let moved = 0, match = 0, other = 0;
-    records.forEach(r => {
-      const o = normalizeOutcome(r.outcomeStatus);
-      if (o === 'done' || o === 'partial') moved++;
-      else if (o === 'not_started' && r.predictionMatched === 'yes') match++;
-      else if (o === 'not_started' && r.predictionMatched === 'no') other++;
-    });
-    return { moved, match, other, total: moved + match + other };
-  }, [records]);
+function Home({ pending, latestReviewed, pendingLocked, current, planBlocked, records, review, plan }) {
+  const stats = useMemo(() => summarizeRecords(records), [records]);
+  const latestRes = latestReviewed ? normalizeActionResult(latestReviewed) : null;
   return (
     <div className="stack">
       <div>
@@ -703,11 +795,20 @@ function Home({ pending, pendingLocked, current, planBlocked, records, review, p
         <h2>振り返り</h2>
         {pending ? (
           <>
-            <p className="pair"><span>整えたいこと</span><b>{intentionOf(pending)}</b></p>
-            <p className="pair"><span>決めた一歩</span><b>{pending.firstStepText}</b></p>
+            <p className="pair"><span>今日したいこと</span><b>{intentionOf(pending)}</b></p>
+            <p className="pair"><span>最初に決めた方法</span><b>{pending.firstStepText}</b></p>
             {pendingLocked
               ? <p className="muted">振り返りは翌朝4:00からできます。</p>
-              : <button className="primary" onClick={review}>振り返る</button>}
+              : <button className="primary" onClick={() => review()}>振り返る</button>}
+          </>
+        ) : latestReviewed ? (
+          <>
+            <p className="pair"><span>前回の記録</span><b>{intentionOf(latestReviewed)}</b></p>
+            <p className="pair"><span>結果</span><b>{getActionResultLabel(latestReviewed)}</b></p>
+            {latestRes === 'alternative_method' && latestReviewed.alternativeActionText && (
+              <p className="pair"><span>できた方法</span><b>{latestReviewed.alternativeActionText}</b></p>
+            )}
+            <button type="button" className="secondary" onClick={() => review(latestReviewed)}>振り返りを編集する</button>
           </>
         ) : (
           <p className="muted">振り返る記録はありません。</p>
@@ -721,7 +822,7 @@ function Home({ pending, pendingLocked, current, planBlocked, records, review, p
             <span className="done">記録済み</span>
           </>
         ) : (
-          <p>今日少し整えたいこと、できなさそうな理由、それでもできそうな一歩を決めます。</p>
+          <p>今日したいと思っていることと、できなさそうな理由（言い訳）を出し、今日はどうするかを考えます。</p>
         )}
         <button className="primary" disabled={planBlocked} onClick={plan}>{planBlocked ? '今日の作戦は登録済みです' : '今日の作戦を考える'}</button>
       </Card>
@@ -731,19 +832,23 @@ function Home({ pending, pendingLocked, current, planBlocked, records, review, p
 }
 
 function Pattern({ stats }) {
-  if (!stats.total) return <Card><h2>最近の予測と実際</h2><p className="muted">記録が増えると、ここに内訳が表示されます。</p></Card>;
+  if (!stats.total) return <Card><h2>最近の振り返り内訳</h2><p className="muted">振り返りが増えると、ここに内訳が表示されます。</p></Card>;
   return (
     <Card>
-      <h2>最近の予測と実際</h2>
+      <h2>最近の振り返り内訳</h2>
       <div className="bar">
-        <i className="moved" style={{ width: `${stats.moved / stats.total * 100}%` }} />
-        <i className="match" style={{ width: `${stats.match / stats.total * 100}%` }} />
-        <i className="other" style={{ width: `${stats.other / stats.total * 100}%` }} />
+        <i className="moved" style={{ width: `${stats.plannedMethod / stats.total * 100}%` }} />
+        <i className="alt" style={{ width: `${stats.alternativeMethod / stats.total * 100}%` }} />
+        <i className="other" style={{ width: `${stats.notStarted / stats.total * 100}%` }} />
       </div>
       <div className="legend">
-        <span><i className="dot moved" />できた <b>{stats.moved}</b></span>
-        <span><i className="dot match" />予測どおり <b>{stats.match}</b></span>
-        <span><i className="dot other" />別の理由 <b>{stats.other}</b></span>
+        <span><i className="dot moved" />最初に決めた方法で着手 <b>{stats.plannedMethod}</b></span>
+        <span><i className="dot alt" />ほかの方法で着手 <b>{stats.alternativeMethod}</b></span>
+        <span><i className="dot other" />未着手 <b>{stats.notStarted}</b></span>
+      </div>
+      <div className="step-stats two">
+        <span>着手あり <b>{stats.started}</b></span>
+        <span>未着手 <b>{stats.notStarted}</b></span>
       </div>
     </Card>
   );
@@ -753,18 +858,20 @@ const EMPTY_PICK = { text: '', pick: null };
 // 候補をそのまま使えば候補の入力元、1文字でも編集したら custom
 const pickSource = s => (s.pick && s.text.trim() === s.pick.text ? s.pick.source : 'custom');
 
-function ChipPick({ title, hint, items, state, setState, maxLength, placeholder, example }) {
+function ChipPick({ id, title, hint, items, state, setState, maxLength, placeholder, example }) {
   const cur = state.text.trim();
   const list = items.slice(0, MAX_CANDIDATES);
   return (
     <Card>
-      <h2>{title}</h2>
-      {hint && <p className="muted">{hint}</p>}
+      <h2><label htmlFor={id}>{title}</label></h2>
+      {hint && <p id={`${id}-hint`} className="muted">{hint}</p>}
       <input
+        id={id}
         value={state.text}
         onChange={e => { const v = e.target.value; setState(s => ({ ...s, text: v })); }}
         maxLength={maxLength}
         placeholder={list.length === 0 ? placeholder : '自分の言葉で入力'}
+        aria-describedby={hint ? `${id}-hint` : undefined}
       />
       {list.length > 0 ? (
         <div className="ref-box">
@@ -822,25 +929,28 @@ function Plan({ profile, records, save, saving, back }) {
       <h1>今日の作戦</h1>
       <p className="muted">候補を参考にしながら、自分の言葉で書いてください。</p>
       <ChipPick
-        title="今日、生活の中で、少し整えたいと思うことは？"
+        id="plan-intention"
+        title="今日、したいと思っていることは？"
         hint="候補を参考にしながら、自分の言葉で書いてください。"
         items={intentionItems} state={intention} setState={setIntention}
         maxLength={LIMITS.intention} placeholder="例：机の上を片付けたい"
         example="入力例：机の上を片付けたい／洗濯物をしまいたい／食器を洗いたい"
       />
       <ChipPick
-        title="今日、それができなさそうなのはなぜ？"
+        id="plan-excuse"
+        title="できなさそうな理由（言い訳）は？"
         hint="候補を参考にしながら、自分の言葉で書いてください。"
         items={excuseItems} state={excuse} setState={setExcuse}
         maxLength={LIMITS.excuse} placeholder="例：時間がない"
         example="入力例：どこから手をつけるか分からない／眠い・だるい／時間がない"
       />
       <ChipPick
-        title="その理由があっても、何ならできそう？"
-        hint="できたかどうかを、あとから判断できる小さな動作にしてください。"
+        id="plan-method"
+        title="その言い訳がある今日は、どうする？"
+        hint="少しだけ試す、別のやり方にする、今日は休んで後日に回すなど、今日の状況に合った対応を自分の言葉で書いてください。"
         items={stepItems} state={step} setState={setStep}
-        maxLength={LIMITS.step} placeholder="例：ゴミを1つ捨てる"
-        example="入力例：ゴミを1つ捨てる／服を1枚片付ける／タイマーを3分かける"
+        maxLength={LIMITS.step} placeholder="例：1つだけ片付ける／明日の朝に回す／今日は休む"
+        example="入力例：ゴミを1つ捨てる／5分だけ試す／今日は休んで明日に回す"
       />
       {valid && (
         <Card>
@@ -887,53 +997,196 @@ function PublicExcuse({ draft, publish }) {
 }
 
 function Review({ item, profile, save, saving, back }) {
-  const [status, setStatus] = useState('');
-  const [match, setMatch] = useState('');
-  const [actual, setActual] = useState('');
+  const initialResult = normalizeActionResult(item) || '';
+  const [actionResult, setActionResult] = useState(initialResult);
+  const [alternativeText, setAlternativeText] = useState(
+    initialResult === 'alternative_method' ? (item.alternativeActionText || '') : ''
+  );
+  const [match, setMatch] = useState(
+    initialResult === 'not_started' ? (item.predictionMatched || '') : ''
+  );
+  const [actual, setActual] = useState(
+    initialResult === 'not_started' && item.predictionMatched === 'no' ? (item.actualExcuse || '') : ''
+  );
   const [addActual, setAddActual] = useState(true);
+  const [error, setError] = useState('');
+  const altRef = useRef(null);
+  const actualRef = useRef(null);
+
   const actualOptions = useMemo(
     () => cleanList([...listOf(profile.preferredExcuses), ...listOf(profile.customExcuses)]).slice(0, MAX_CANDIDATES),
     [profile]
   );
-  const asked = status === 'not_started';
-  const canSave = status === 'done' || (status === 'not_started' && match && (match !== 'no' || actual.trim()));
-  const choose = v => { setStatus(v); setMatch(''); setActual(''); };
+
+  const choose = v => {
+    setActionResult(v);
+    setError('');
+    if (v !== 'alternative_method') setAlternativeText('');
+    if (v !== 'not_started') {
+      setMatch('');
+      setActual('');
+    }
+  };
+
+  const handleSubmit = e => {
+    e.preventDefault();
+    if (saving) return;
+    if (!VALID_ACTION_RESULTS.includes(actionResult)) {
+      setError('actionResult');
+      return;
+    }
+    if (actionResult === 'alternative_method') {
+      const trimmedAlt = alternativeText.trim();
+      if (!trimmedAlt) {
+        setError('alternative');
+        if (altRef.current) altRef.current.focus();
+        return;
+      }
+      if (trimmedAlt.length > LIMITS.alternative) {
+        setError('alternativeLength');
+        if (altRef.current) altRef.current.focus();
+        return;
+      }
+    }
+    if (actionResult === 'not_started') {
+      if (!match) {
+        setError('match');
+        return;
+      }
+      if (match === 'no' && !actual.trim()) {
+        setError('actual');
+        if (actualRef.current) actualRef.current.focus();
+        return;
+      }
+    }
+    setError('');
+    save({
+      actionResult,
+      outcomeStatus: actionResult,
+      alternativeActionText: actionResult === 'alternative_method' ? alternativeText.trim() : null,
+      predictionMatched: actionResult === 'not_started' ? match : null,
+      actualExcuse: actionResult === 'not_started' && match === 'no' ? actual.trim() : null,
+      addActualToLibrary: actionResult === 'not_started' && match === 'no' && addActual
+    });
+  };
+
   return (
-    <div className="stack">
-      <button className="back" onClick={back}>← ホームへ</button>
+    <form className="stack" onSubmit={handleSubmit} noValidate>
+      <button type="button" className="back" onClick={back}>← ホームへ</button>
       <h1>振り返り</h1>
       <Card>
-        <p className="pair"><span>整えたいこと</span><b>{intentionOf(item)}</b></p>
-        <p className="pair"><span>決めた一歩</span><b>{item.firstStepText}</b></p>
+        <p className="pair"><span>今日したいこと</span><b>{intentionOf(item)}</b></p>
+        <p className="pair"><span>できなさそうな理由</span><b>{item.predictedExcuse}</b></p>
+        <p className="pair"><span>最初に決めた方法</span><b>{item.firstStepText}</b></p>
       </Card>
       <Card>
-        <h2>前回決めた一歩は、できましたか？</h2>
-        <div className="choices">
-          <button type="button" className={status === 'done' ? 'choice on' : 'choice'} onClick={() => choose('done')}>できた</button>
-          <button type="button" className={status === 'not_started' ? 'choice on' : 'choice'} onClick={() => choose('not_started')}>できなかった</button>
+        <h2 id="review-result-heading">今日したいと思っていたことについて、その後どうなりましたか？</h2>
+        <div className="choices" role="radiogroup" aria-labelledby="review-result-heading">
+          {ACTION_RESULTS.map(opt => {
+            const selected = actionResult === opt.value;
+            return (
+              <label key={opt.value} className={selected ? 'choice radio-label on' : 'choice radio-label'}>
+                <input
+                  type="radio"
+                  name="actionResult"
+                  value={opt.value}
+                  checked={selected}
+                  onChange={() => choose(opt.value)}
+                />
+                <span>{opt.label}</span>
+              </label>
+            );
+          })}
         </div>
+        {error === 'actionResult' && (
+          <p className="field-error" role="alert">当てはまるものを1つ選んでください。</p>
+        )}
       </Card>
-      {asked && (
+      {actionResult === 'alternative_method' && (
         <Card>
-          <h2>予測した理由は、実際にも当てはまりましたか？</h2>
+          <h2><label htmlFor="alternative-action-input">どのような方法で取りかかることができましたか？</label></h2>
+          <p id="alternative-action-hint" className="muted">最初に考えていた方法ではなく、実際にできたことを書いてください。</p>
+          <input
+            id="alternative-action-input"
+            ref={altRef}
+            value={alternativeText}
+            maxLength={LIMITS.alternative}
+            onChange={e => {
+              setAlternativeText(e.target.value);
+              if (error === 'alternative' || error === 'alternativeLength') setError('');
+            }}
+            placeholder="例：1つだけ片付けた／場所を変えて5分だけ手をつけた"
+            aria-required="true"
+            aria-invalid={error === 'alternative' || error === 'alternativeLength'}
+            aria-describedby={error === 'alternative' || error === 'alternativeLength' ? 'alternative-action-hint alternative-action-error' : 'alternative-action-hint'}
+          />
+          {error === 'alternative' && (
+            <p id="alternative-action-error" className="field-error" role="alert">実際にできた方法を入力してください。</p>
+          )}
+          {error === 'alternativeLength' && (
+            <p id="alternative-action-error" className="field-error" role="alert">{LIMITS.alternative}文字以内で入力してください。</p>
+          )}
+        </Card>
+      )}
+      {actionResult === 'not_started' && (
+        <Card>
+          <h2 id="review-match-heading">予測した理由は、実際にも当てはまりましたか？</h2>
           <p className="muted">予測した理由：{item.predictedExcuse}</p>
-          <div className="choices">
-            <button type="button" className={match === 'yes' ? 'choice on' : 'choice'} onClick={() => setMatch('yes')}>当てはまった</button>
-            <button type="button" className={match === 'no' ? 'choice on' : 'choice'} onClick={() => setMatch('no')}>別の理由だった</button>
-            <button type="button" className={match === 'unknown' ? 'choice on' : 'choice'} onClick={() => setMatch('unknown')}>よく分からない</button>
+          <div className="choices" role="radiogroup" aria-labelledby="review-match-heading">
+            {[
+              { value: 'yes', label: '当てはまった' },
+              { value: 'no', label: '別の理由だった' },
+              { value: 'unknown', label: 'よく分からない' }
+            ].map(opt => {
+              const selected = match === opt.value;
+              return (
+                <label key={opt.value} className={selected ? 'choice radio-label on' : 'choice radio-label'}>
+                  <input
+                    type="radio"
+                    name="predictionMatched"
+                    value={opt.value}
+                    checked={selected}
+                    onChange={() => {
+                      setMatch(opt.value);
+                      if (error === 'match' || error === 'actual') setError('');
+                    }}
+                  />
+                  <span>{opt.label}</span>
+                </label>
+              );
+            })}
           </div>
+          {error === 'match' && (
+            <p className="field-error" role="alert">当てはまるものを1つ選んでください。</p>
+          )}
           {match === 'no' && (
             <>
-              <label>
+              <label htmlFor="actual-excuse-input">
                 実際の理由
-                <input value={actual} maxLength={LIMITS.excuse} onChange={e => setActual(e.target.value)} placeholder="例：時間がなかった" />
+                <input
+                  id="actual-excuse-input"
+                  ref={actualRef}
+                  value={actual}
+                  maxLength={LIMITS.excuse}
+                  onChange={e => {
+                    setActual(e.target.value);
+                    if (error === 'actual') setError('');
+                  }}
+                  placeholder="例：時間がなかった"
+                  aria-required="true"
+                  aria-invalid={error === 'actual'}
+                  aria-describedby={error === 'actual' ? 'actual-excuse-error' : undefined}
+                />
               </label>
+              {error === 'actual' && (
+                <p id="actual-excuse-error" className="field-error" role="alert">実際の理由を入力してください。</p>
+              )}
               {actualOptions.length > 0 && (
                 <div className="ref-box">
                   <small className="ref-title">参考にする</small>
                   <div className="chips ref-chips">
                     {actualOptions.map(x => (
-                      <button key={x} type="button" className={actual.trim() === x ? 'chip chip-sm on' : 'chip chip-sm'} onClick={() => setActual(x)}>{x}</button>
+                      <button key={x} type="button" className={actual.trim() === x ? 'chip chip-sm on' : 'chip chip-sm'} onClick={() => { setActual(x); if (error === 'actual') setError(''); }}>{x}</button>
                     ))}
                   </div>
                 </div>
@@ -946,34 +1199,67 @@ function Review({ item, profile, save, saving, back }) {
           )}
         </Card>
       )}
-      <button
-        className="primary"
-        disabled={!canSave || saving}
-        onClick={() => save({
-          outcomeStatus: status,
-          predictionMatched: asked ? match : null,
-          actualExcuse: asked && match === 'no' ? actual.trim() : null,
-          addActualToLibrary: asked && match === 'no' && addActual
-        })}
-      >保存する</button>
-    </div>
+      <button type="submit" className="primary" disabled={saving}>保存する</button>
+    </form>
   );
 }
 
-function MyRecords({ records, profile }) {
-  const [view, setView] = useState('reasons');
+function MyRecords({ records, profile, editReview }) {
+  const [view, setView] = useState('history');
+  const titleMap = {
+    history: '振り返り履歴',
+    reasons: '未着手の理由',
+    steps: 'できた方法'
+  };
   return (
     <div className="stack">
       <div>
         <p className="eyebrow">自分の記録</p>
-        <h1>{view === 'reasons' ? 'できなかった理由' : '踏み出せた一歩'}</h1>
+        <h1>{titleMap[view]}</h1>
       </div>
-      <div className="record-switch">
-        <button type="button" className={view === 'reasons' ? 'on' : ''} onClick={() => setView('reasons')}>できなかった理由</button>
-        <button type="button" className={view === 'steps' ? 'on' : ''} onClick={() => setView('steps')}>踏み出せた一歩</button>
+      <div className="record-switch three">
+        <button type="button" className={view === 'history' ? 'on' : ''} onClick={() => setView('history')}>履歴</button>
+        <button type="button" className={view === 'reasons' ? 'on' : ''} onClick={() => setView('reasons')}>理由</button>
+        <button type="button" className={view === 'steps' ? 'on' : ''} onClick={() => setView('steps')}>できた方法</button>
       </div>
-      {view === 'reasons' ? <ReasonList records={records} profile={profile} /> : <StepList records={records} />}
+      {view === 'history' && <RecordHistoryList records={records} editReview={editReview} />}
+      {view === 'reasons' && <ReasonList records={records} profile={profile} />}
+      {view === 'steps' && <StepList records={records} />}
     </div>
+  );
+}
+
+function RecordHistoryList({ records, editReview }) {
+  if (records.length === 0) {
+    return <Card><p className="muted">まだ記録がありません。</p></Card>;
+  }
+  return (
+    <>
+      <p className="muted">これまでの作戦と振り返りの結果を確認・編集できます。</p>
+      {records.map(r => {
+        const res = normalizeActionResult(r);
+        return (
+          <Card key={r.id}>
+            <div className="post-head">
+              <strong>{r.recordDate || '記録'}</strong>
+              <span className={`result-badge ${res || ''}`}>{getActionResultLabel(r)}</span>
+            </div>
+            <p className="pair"><span>今日したいこと</span><b>{intentionOf(r)}</b></p>
+            <p className="pair"><span>言い訳</span><b>{r.predictedExcuse || '—'}</b></p>
+            <p className="pair"><span>最初に決めた方法</span><b>{r.firstStepText || '—'}</b></p>
+            {res === 'alternative_method' && r.alternativeActionText && (
+              <p className="pair"><span>ほかの方法</span><b>{r.alternativeActionText}</b></p>
+            )}
+            {res === 'not_started' && r.predictionMatched === 'no' && r.actualExcuse && (
+              <p className="pair"><span>実際の理由</span><b>{r.actualExcuse}</b></p>
+            )}
+            {res && (
+              <button type="button" className="secondary" onClick={() => editReview(r)}>振り返りを編集</button>
+            )}
+          </Card>
+        );
+      })}
+    </>
   );
 }
 
@@ -983,7 +1269,7 @@ function ReasonList({ records, profile }) {
     (profile.customExcuses || []).forEach(x => { if (x) map[x] = 0 });
     const add = x => { if (!x) return; map[x] = (map[x] || 0) + 1 };
     records.forEach(r => {
-      if (normalizeOutcome(r.outcomeStatus) !== 'not_started') return;
+      if (normalizeActionResult(r) !== 'not_started') return;
       if (r.predictionMatched === 'yes') add(r.predictedExcuse);
       if (r.predictionMatched === 'no') add(r.actualExcuse);
     });
@@ -991,7 +1277,7 @@ function ReasonList({ records, profile }) {
   }, [records, profile]);
   return (
     <>
-      <p className="muted">実際にできなかった理由として記録された回数が多い順です。</p>
+      <p className="muted">未着手だった日に記録された理由の回数です。</p>
       {data.length === 0
         ? <Card><p className="muted">まだ登録された言い訳がありません。</p></Card>
         : data.map((x, i) => <Card key={x.name}><div className="rank"><b>{i + 1}</b><h2>{x.name}</h2><strong>{x.count}回</strong></div></Card>)
@@ -1005,37 +1291,59 @@ function StepList({ records }) {
     const map = {};
     records.forEach((r, i) => {
       if (!r.firstStepText) return;
-      const x = map[r.firstStepText] || { name: r.firstStepText, setCount: 0, doneCount: 0, continuedCount: 0, last: 0, excuses: {} };
+      const x = map[r.firstStepText] || {
+        name: r.firstStepText,
+        setCount: 0,
+        plannedCount: 0,
+        altCount: 0,
+        doneCount: 0,
+        last: 0,
+        excuses: {},
+        altTexts: []
+      };
       x.setCount++;
       x.last = Math.max(x.last, (tsToMs(r.createdAt) || 0) / 1000 || records.length - i);
-      const o = normalizeOutcome(r.outcomeStatus);
-      if (o === 'done' || o === 'partial') {
+      const res = normalizeActionResult(r);
+      if (res === 'planned_method') {
+        x.plannedCount++;
         x.doneCount++;
-        if (r.continuedBeyondFirstStep) x.continuedCount++;
+        if (r.predictedExcuse) x.excuses[r.predictedExcuse] = (x.excuses[r.predictedExcuse] || 0) + 1;
+      } else if (res === 'alternative_method') {
+        x.altCount++;
+        x.doneCount++;
+        if (r.alternativeActionText && !x.altTexts.includes(r.alternativeActionText)) {
+          x.altTexts.push(r.alternativeActionText);
+        }
         if (r.predictedExcuse) x.excuses[r.predictedExcuse] = (x.excuses[r.predictedExcuse] || 0) + 1;
       }
       map[r.firstStepText] = x;
     });
     return Object.values(map)
       .map(x => ({ ...x, topExcuses: Object.entries(x.excuses).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ja')).slice(0, 3) }))
-      .sort((a, b) => b.doneCount - a.doneCount || b.continuedCount - a.continuedCount || b.last - a.last);
+      .sort((a, b) => b.doneCount - a.doneCount || b.last - a.last);
   }, [records]);
   return (
     <>
-      <p className="muted">実際にできた回数が多い順です。どの言い訳の日に踏み出せたかも確認できます。</p>
+      <p className="muted">最初に決めた方法と、ほかの方法で着手できた記録です。</p>
       {data.length === 0
-        ? <Card><p className="muted">まだ最初の一歩を設定した記録がありません。</p></Card>
+        ? <Card><p className="muted">まだ記録がありません。</p></Card>
         : data.map((x, i) => (
           <Card key={x.name}>
             <div className="rank"><b>{i + 1}</b><h2>{x.name}</h2><strong>{x.doneCount}回</strong></div>
             <div className="step-stats">
               <span>設定した <b>{x.setCount}</b></span>
-              <span>できた <b>{x.doneCount}</b></span>
-              {x.continuedCount > 0 && <span>その先も続いた <b>{x.continuedCount}</b></span>}
+              <span>当初方法 <b>{x.plannedCount}</b></span>
+              <span>ほかの方法 <b>{x.altCount}</b></span>
             </div>
+            {x.altTexts.length > 0 && (
+              <div className="excuse-links">
+                <small>実際にできたほかの方法</small>
+                {x.altTexts.slice(0, 5).map(t => <span key={t}>{t}</span>)}
+              </div>
+            )}
             {x.topExcuses.length > 0 && (
               <div className="excuse-links">
-                <small>この一歩ができた日の予測</small>
+                <small>着手できた日の言い訳</small>
                 {x.topExcuses.map(([name, count]) => <span key={name}>「{name}」 <b>{count}回</b></span>)}
               </div>
             )}
@@ -1051,8 +1359,8 @@ function Community({ posts, uid, react, hidePost }) {
     <div className="stack">
       <div>
         <p className="eyebrow">みんなの記録</p>
-        <h1>予測と最初の一歩</h1>
-        <p className="muted">みんなが共有した予測と最初の一歩です。</p>
+        <h1>みんなの言い訳と対応</h1>
+        <p className="muted">みんなが共有した言い訳と今日の対応です。</p>
       </div>
       {posts.length === 0
         ? <Card><p className="muted">まだ共有された記録がありません。</p></Card>
@@ -1072,7 +1380,7 @@ function Post({ post, uid, react, hidePost }) {
         {post.ownerUid === uid && <small className="yours">あなたの記録</small>}
       </div>
       <div className="community-plan sentence">
-        <p>「{excuse}」と思う日でも、<br /><strong>{post.firstStepText || '最初の一歩は未登録'}</strong>ならできるかも。</p>
+        <p>「{excuse}」という言い訳がある日：<br /><strong>{post.firstStepText || '対応は未登録'}</strong></p>
       </div>
       <div className="reacts">
         {REACTIONS.map(r => (
